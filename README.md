@@ -10,9 +10,9 @@ It started as a hands-on robotics experiment with the 4tronix M.A.R.S. Rover pla
 
 ## 🔗 Project links
 
-* 🌐 **Landing page:** [astro-sheeps.github.io/marsy](https://astro-sheeps.github.io/marsy/)
-* 📚 **Documentation / Wiki:** [Marsy Wiki](https://github.com/astro-sheeps/marsy/wiki)
-* 💻 **Source code:** [GitHub repository](https://github.com/astro-sheeps/marsy)
+* 🌐 **Landing page:** [astro-sheeps.github.io/marsy](https://astro-sheep.github.io/marsy/)
+* 📚 **Documentation / Wiki:** [Marsy Wiki](https://github.com/astro-sheep/marsy/wiki)
+* 💻 **Source code:** [GitHub repository](https://github.com/astro-sheep/marsy)
 
 ---
 
@@ -43,7 +43,7 @@ Current hardware platform:
 * 🔘 keypad / onboard controls;
 * 📷 camera for future navigation experiments.
 
-More detailed hardware notes are kept in the [Wiki](https://github.com/astro-sheeps/marsy/wiki).
+More detailed hardware notes are kept in the [Wiki](https://github.com/astro-sheep/marsy/wiki).
 
 ---
 
@@ -51,7 +51,7 @@ More detailed hardware notes are kept in the [Wiki](https://github.com/astro-she
 
 Technical documentation is maintained in the project Wiki:
 
-👉 [Open Marsy Wiki](https://github.com/astro-sheeps/marsy/wiki)
+👉 [Open Marsy Wiki](https://github.com/astro-sheep/marsy/wiki)
 
 ---
 
