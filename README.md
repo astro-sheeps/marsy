@@ -1,6 +1,6 @@
 # 🚀 Marsy Rover
 
-**Marsy** is a small Raspberry Pi based rover project by **AstroSheeps** 🐑✨
+**Marsy** is a small Raspberry Pi based rover project by **AstroSheep** 🐑✨
 
 It started as a hands-on robotics experiment with the 4tronix M.A.R.S. Rover platform and is growing into a playful testbed for autonomous navigation, sensor-based decision making, and LLM-assisted robot control.
 
@@ -10,7 +10,7 @@ It started as a hands-on robotics experiment with the 4tronix M.A.R.S. Rover pla
 
 ## 🔗 Project links
 
-* 🌐 **Landing page:** [astro-sheeps.github.io/marsy](https://astro-sheep.github.io/marsy/)
+* 🌐 **Landing page:** [astro-sheep.github.io/marsy](https://astro-sheep.github.io/marsy/)
 * 📚 **Documentation / Wiki:** [Marsy Wiki](https://github.com/astro-sheep/marsy/wiki)
 * 💻 **Source code:** [GitHub repository](https://github.com/astro-sheep/marsy)
 
@@ -73,9 +73,9 @@ Recommended precautions:
 
 
 
-## 🐑 About AstroSheeps
+## 🐑 About AstroSheep
 
-AstroSheeps is a small creative space-tech and astronomy project exploring playful engineering, tools, astronomy workflows, and tiny robots with unnecessarily ambitious mission patches.
+AstroSheep is a small creative space-tech and astronomy project exploring playful engineering, tools, astronomy workflows, and tiny robots with unnecessarily ambitious mission patches.
 
 Marsy is part of that flock. 🐑🚀
 
