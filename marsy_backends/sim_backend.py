@@ -1,484 +1,360 @@
 """
 Marsy simulator backend.
 
-This backend adapts the external 4tronix rover simulator to the Marsy API.
+This backend is intentionally self-contained: it does not import the original
+external 4tronix rover simulator package. It talks to our own PyQt/Flask
+simulator at simulator/marsy_sim_ui.py over HTTP.
 
-External simulator:
-    external/4tronix-rover-simulator/roversimui.py
+Expected simulator endpoints:
+    POST /          accepts rover commands: wheelMotors, servos, rgbLeds
+    GET  /state     returns simulator state and sonar distance
+    GET  /distance  returns distance_cm / ultrasonicRange
+    POST /control   optional control endpoint: stop/reset/manual
 
-Important:
-    The original roversimulator.py can hang because it waits for HTTP responses.
-    This backend sends fire-and-forget HTTP POST commands through a raw socket.
+Used by:
+    from marsy_backends.sim_backend import rover
+
+Build stamp:
+    SIM_BACKEND_NO_EXTERNAL_V1
 """
 
-import importlib
+from __future__ import annotations
+
 import json
 import os
-import socket
-import sys
-from pathlib import Path
+import time
+import urllib.error
+import urllib.request
+from dataclasses import dataclass, field
+from typing import Any, Dict, Iterable, Mapping, Optional
 
+BUILD_STAMP = "SIM_BACKEND_NO_EXTERNAL_V1"
 
-# ---------------------------------------------------------------------
-# Paths
-# ---------------------------------------------------------------------
-
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
-SIM_PATH = PROJECT_ROOT / "external" / "4tronix-rover-simulator"
-
-SIM_HOST = "127.0.0.1"
-SIM_PORT = 8523
-
-if str(SIM_PATH) not in sys.path:
-    sys.path.insert(0, str(SIM_PATH))
-
-
-# Import external simulator module only as a namespace holder.
-# We patch its functions below.
-rover = importlib.import_module("roversimulator")
-
-
-# ---------------------------------------------------------------------
-# Config
-# ---------------------------------------------------------------------
-
+SIM_HOST = os.getenv("MARSY_SIM_HOST", "127.0.0.1")
+SIM_PORT = int(os.getenv("MARSY_SIM_PORT", "8523"))
+SIM_BASE_URL = os.getenv("MARSY_SIM_BASE_URL", f"http://{SIM_HOST}:{SIM_PORT}")
+SIM_TIMEOUT_S = float(os.getenv("MARSY_SIM_TIMEOUT", "0.25"))
 SIM_VERBOSE = os.getenv("MARSY_SIM_VERBOSE", "0") == "1"
-SIM_SOCKET_TIMEOUT = float(os.getenv("MARSY_SIM_SOCKET_TIMEOUT", "0.2"))
-
-_num_pixels = 4
-_leds = [[0, 0, 0] for _ in range(_num_pixels)]
-
-_l_dir = 0
-_r_dir = 0
 
 
-# ---------------------------------------------------------------------
-# Low-level simulator transport
-# ---------------------------------------------------------------------
-
-def _send_to_simulator(message, timeout=None):
-    """
-    Send one command to roversimui.py.
-
-    This is intentionally fire-and-forget:
-    - open TCP socket
-    - send minimal HTTP POST
-    - close socket
-    - do not wait for HTTP response
-
-    This avoids hangs caused by the external simulator not responding quickly.
-    """
-    if timeout is None:
-        timeout = SIM_SOCKET_TIMEOUT
-
-    try:
-        body = json.dumps(message).encode("utf-8")
-
-        request = (
-            b"POST / HTTP/1.1\r\n"
-            b"Host: 127.0.0.1:8523\r\n"
-            b"Content-Type: application/json\r\n"
-            + f"Content-Length: {len(body)}\r\n".encode("utf-8")
-            + b"Connection: close\r\n"
-            + b"\r\n"
-            + body
-        )
-
-        with socket.create_connection((SIM_HOST, SIM_PORT), timeout=timeout) as sock:
-            sock.sendall(request)
-
-        return True
-
-    except OSError as exc:
-        if SIM_VERBOSE:
-            print(f"[SIM WARNING] simulator socket error: {exc}", flush=True)
-        return False
-
-
-def _clamp_speed(speed):
-    return int(max(0, min(100, speed)))
-
-
-def _clamp_degrees(degrees):
-    return int(max(-90, min(90, degrees)))
-
-
-# ---------------------------------------------------------------------
-# General functions
-# ---------------------------------------------------------------------
-
-def sim_init(brightness=0, PiBit=False):
-    """
-    Simulator init.
-
-    Does not touch real GPIO. Keeps same signature as real rover.init().
-    """
-    print("Initialized", flush=True)
-
-
-def sim_cleanup():
-    """
-    Simulator cleanup.
-
-    Do not call the original roversimulator.cleanup(), because it may hang.
-    """
-    sim_stop()
+def _debug(message: str) -> None:
     if SIM_VERBOSE:
-        print("Simulator cleanup done", flush=True)
+        print(f"[marsy sim_backend] {message}", flush=True)
 
 
-def sim_version():
-    return 4
+def _url(path: str) -> str:
+    if not path.startswith("/"):
+        path = "/" + path
+    return SIM_BASE_URL.rstrip("/") + path
 
 
-# ---------------------------------------------------------------------
-# Motor functions
-# ---------------------------------------------------------------------
+def _post_json(path: str, payload: Mapping[str, Any], timeout: Optional[float] = None) -> Optional[Dict[str, Any]]:
+    """POST JSON to the simulator and return JSON response if available."""
+    if timeout is None:
+        timeout = SIM_TIMEOUT_S
 
-def sim_stop():
-    global _l_dir, _r_dir
-
-    _l_dir = 0
-    _r_dir = 0
-
-    return _send_to_simulator({
-        "wheelMotors": {
-            "l": [0, 0],
-            "r": [0, 0],
-        }
-    })
-
-
-def sim_brake():
-    global _l_dir, _r_dir
-
-    _l_dir = 0
-    _r_dir = 0
-
-    return _send_to_simulator({
-        "wheelMotors": {
-            "l": [100, 100],
-            "r": [100, 100],
-        }
-    })
-
-
-def sim_forward(speed):
-    global _l_dir, _r_dir
-
-    speed = _clamp_speed(speed)
-    _l_dir = 1
-    _r_dir = 1
-
-    return _send_to_simulator({
-        "wheelMotors": {
-            "l": [speed, 0],
-            "r": [speed, 0],
-        }
-    })
-
-
-def sim_reverse(speed):
-    global _l_dir, _r_dir
-
-    speed = _clamp_speed(speed)
-    _l_dir = -1
-    _r_dir = -1
-
-    return _send_to_simulator({
-        "wheelMotors": {
-            "l": [0, speed],
-            "r": [0, speed],
-        }
-    })
-
-
-def sim_spin_left(speed):
-    global _l_dir, _r_dir
-
-    speed = _clamp_speed(speed)
-    _l_dir = -1
-    _r_dir = 1
-
-    return _send_to_simulator({
-        "wheelMotors": {
-            "l": [0, speed],
-            "r": [speed, 0],
-        }
-    })
-
-
-def sim_spin_right(speed):
-    global _l_dir, _r_dir
-
-    speed = _clamp_speed(speed)
-    _l_dir = 1
-    _r_dir = -1
-
-    return _send_to_simulator({
-        "wheelMotors": {
-            "l": [speed, 0],
-            "r": [0, speed],
-        }
-    })
-
-
-def sim_turn_forward(left_speed, right_speed):
-    global _l_dir, _r_dir
-
-    left_speed = _clamp_speed(left_speed)
-    right_speed = _clamp_speed(right_speed)
-
-    _l_dir = 1
-    _r_dir = 1
-
-    return _send_to_simulator({
-        "wheelMotors": {
-            "l": [left_speed, 0],
-            "r": [right_speed, 0],
-        }
-    })
-
-
-def sim_turn_reverse(left_speed, right_speed):
-    global _l_dir, _r_dir
-
-    left_speed = _clamp_speed(left_speed)
-    right_speed = _clamp_speed(right_speed)
-
-    _l_dir = -1
-    _r_dir = -1
-
-    return _send_to_simulator({
-        "wheelMotors": {
-            "l": [0, left_speed],
-            "r": [0, right_speed],
-        }
-    })
-
-
-# ---------------------------------------------------------------------
-# Servo functions
-# ---------------------------------------------------------------------
-
-def sim_set_servo(servo, degrees):
-    """
-    Set one servo angle.
-
-    Servo numbers follow the original 4tronix mapping:
-        mast: 0
-        front-left: 9
-        rear-left: 11
-        rear-right: 13
-        front-right: 15
-    """
-    servo = int(servo)
-    degrees = _clamp_degrees(degrees)
-
-    return _send_to_simulator({
-        "servos": {
-            str(servo): degrees,
-        }
-    })
-
-
-def sim_set_servos(servo_angles):
-    """
-    Set several servos in one command.
-
-    Example:
-        rover.setServos({
-            9: 20,
-            15: 20,
-            11: -20,
-            13: -20,
-        })
-
-    This is much faster than four separate setServo() calls.
-    """
-    payload = {
-        "servos": {
-            str(int(servo)): _clamp_degrees(degrees)
-            for servo, degrees in servo_angles.items()
-        }
-    }
-
-    return _send_to_simulator(payload)
-
-
-def sim_stop_servos():
-    """
-    Simulator has no independent servo PWM stop state.
-    Keep current angles.
-    """
-    return True
-
-
-# ---------------------------------------------------------------------
-# Fake sensors
-# ---------------------------------------------------------------------
-
-_distance_sequence_text = os.getenv("MARSY_SIM_DISTANCE_SEQUENCE", "").strip()
-_distance_default_cm = float(os.getenv("MARSY_SIM_DISTANCE_CM", "100"))
-
-_distance_sequence = []
-_distance_index = 0
-
-if _distance_sequence_text:
-    try:
-        _distance_sequence = [
-            float(value.strip())
-            for value in _distance_sequence_text.split(",")
-            if value.strip()
-        ]
-    except ValueError:
-        print(
-            "Invalid MARSY_SIM_DISTANCE_SEQUENCE. Using default distance.",
-            flush=True,
-        )
-        _distance_sequence = []
-
-
-def sim_get_distance():
-    """
-    Fake ultrasonic distance.
-
-    Modes:
-
-    Constant:
-        MARSY_SIM_DISTANCE_CM=20
-
-    Sequence:
-        MARSY_SIM_DISTANCE_SEQUENCE=100,80,60,40,20,100
-
-    After sequence ends, last value is repeated.
-    """
-    global _distance_index
-
-    if _distance_sequence:
-        if _distance_index < len(_distance_sequence):
-            value = _distance_sequence[_distance_index]
-            _distance_index += 1
-            return value
-
-        return _distance_sequence[-1]
-
-    return _distance_default_cm
-
-
-def sim_get_battery():
-    return 7.8
-
-
-# ---------------------------------------------------------------------
-# Keypad compatibility
-# ---------------------------------------------------------------------
-
-def sim_get_key():
-    return 0
-
-
-def sim_get_switch():
-    return False
-
-
-# ---------------------------------------------------------------------
-# RGB LED compatibility
-# ---------------------------------------------------------------------
-
-def sim_from_rgb(red, green, blue):
-    return (int(red) << 16) + (int(green) << 8) + int(blue)
-
-
-def sim_to_rgb(color):
-    return (
-        (color & 0xFF0000) >> 16,
-        (color & 0x00FF00) >> 8,
-        color & 0x0000FF,
+    body = json.dumps(payload).encode("utf-8")
+    request = urllib.request.Request(
+        _url(path),
+        data=body,
+        headers={"Content-Type": "application/json"},
+        method="POST",
     )
 
-
-def sim_set_pixel(pixel_id, color):
-    pixel_id = int(pixel_id)
-
-    if 0 <= pixel_id < _num_pixels:
-        red, green, blue = sim_to_rgb(color)
-        _leds[pixel_id] = [red, green, blue]
-
-
-def sim_set_color(color):
-    for i in range(_num_pixels):
-        sim_set_pixel(i, color)
-
-
-def sim_clear():
-    for i in range(_num_pixels):
-        _leds[i] = [0, 0, 0]
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            raw = response.read()
+            if not raw:
+                return None
+            try:
+                return json.loads(raw.decode("utf-8"))
+            except json.JSONDecodeError:
+                return None
+    except (urllib.error.URLError, TimeoutError, OSError) as exc:
+        _debug(f"POST {path} failed: {exc}")
+        return None
 
 
-def sim_show():
-    rgb_leds = {
-        str(i): _leds[i]
-        for i in range(_num_pixels)
-    }
+def _get_json(path: str, timeout: Optional[float] = None) -> Optional[Dict[str, Any]]:
+    """GET JSON from the simulator and return dict if available."""
+    if timeout is None:
+        timeout = SIM_TIMEOUT_S
 
-    return _send_to_simulator({
-        "rgbLeds": rgb_leds,
-    })
-
-
-def sim_rainbow():
-    # Minimal compatibility placeholder.
-    # We can implement full rainbow later if needed.
-    pass
-
-
-def sim_wheel(pos):
-    pos = int(pos) % 256
-
-    if pos < 85:
-        return sim_from_rgb(255 - pos * 3, pos * 3, 0)
-
-    if pos < 170:
-        pos -= 85
-        return sim_from_rgb(0, 255 - pos * 3, pos * 3)
-
-    pos -= 170
-    return sim_from_rgb(pos * 3, 0, 255 - pos * 3)
+    try:
+        with urllib.request.urlopen(_url(path), timeout=timeout) as response:
+            raw = response.read()
+            if not raw:
+                return None
+            try:
+                data = json.loads(raw.decode("utf-8"))
+            except json.JSONDecodeError:
+                return None
+            return data if isinstance(data, dict) else None
+    except (urllib.error.URLError, TimeoutError, OSError) as exc:
+        _debug(f"GET {path} failed: {exc}")
+        return None
 
 
-# ---------------------------------------------------------------------
-# Patch external rover module
-# ---------------------------------------------------------------------
+def _clamp_speed(speed: Any) -> int:
+    try:
+        value = int(speed)
+    except (TypeError, ValueError):
+        value = 0
+    return max(0, min(100, value))
 
-rover.init = sim_init
-rover.cleanup = sim_cleanup
-rover.version = sim_version
 
-rover.stop = sim_stop
-rover.brake = sim_brake
-rover.forward = sim_forward
-rover.reverse = sim_reverse
-rover.spinLeft = sim_spin_left
-rover.spinRight = sim_spin_right
-rover.turnForward = sim_turn_forward
-rover.turnReverse = sim_turn_reverse
+def _clamp_servo_angle(degrees: Any) -> int:
+    try:
+        value = int(round(float(degrees)))
+    except (TypeError, ValueError):
+        value = 0
+    return max(-90, min(90, value))
 
-rover.setServo = sim_set_servo
-rover.setServos = sim_set_servos
-rover.stopServos = sim_stop_servos
 
-rover.getDistance = sim_get_distance
-rover.getBattery = sim_get_battery
-rover.getKey = sim_get_key
-rover.getSwitch = sim_get_switch
+def _parse_distance(value: Any) -> Optional[float]:
+    try:
+        distance = float(value)
+    except (TypeError, ValueError):
+        return None
+    return distance
 
-rover.fromRGB = sim_from_rgb
-rover.toRGB = sim_to_rgb
-rover.setPixel = sim_set_pixel
-rover.setColor = sim_set_color
-rover.clear = sim_clear
-rover.show = sim_show
-rover.rainbow = sim_rainbow
-rover.wheel = sim_wheel
-rover.numPixels = _num_pixels
+
+@dataclass
+class SimRover:
+    """
+    Small rover-like object compatible with the original 4tronix rover API.
+
+    It intentionally implements only the calls used by Marsy core, missions,
+    and simple tests. All hardware actions are translated into HTTP commands
+    understood by simulator/marsy_sim_ui.py.
+    """
+
+    numPixels: int = 4
+    offsets: list[int] = field(default_factory=lambda: [0] * 16)
+
+    _brightness: int = 0
+    _initialized: bool = False
+    _leds: list[list[int]] = field(default_factory=lambda: [[0, 0, 0] for _ in range(4)])
+    _last_distance_sequence: list[float] = field(default_factory=list)
+    _last_distance_index: int = 0
+
+    # ------------------------------------------------------------------
+    # General API
+    # ------------------------------------------------------------------
+
+    def init(self, brightness: int = 0, PiBit: bool = False) -> None:  # noqa: N803 - keep 4tronix arg name
+        self._brightness = int(brightness or 0)
+        self._initialized = True
+        _debug(f"init(brightness={brightness}, PiBit={PiBit}) using {SIM_BASE_URL}")
+        # Keep init light-touch: do not force reset, because missions may set mode.
+        _get_json("/state")
+
+    def cleanup(self) -> None:
+        # Do not call any external simulator cleanup. Just stop motors and servos.
+        self.stop()
+        self.stopServos()
+        self._initialized = False
+
+    def version(self) -> int:
+        # Original 4tronix M.A.R.S. rover reports model 4.
+        return 4
+
+    # ------------------------------------------------------------------
+    # Motor API
+    # ------------------------------------------------------------------
+
+    def _send_wheel_motors(self, left_fwd: int, left_rev: int, right_fwd: int, right_rev: int) -> None:
+        payload = {
+            "wheelMotors": {
+                "l": [_clamp_speed(left_fwd), _clamp_speed(left_rev)],
+                "r": [_clamp_speed(right_fwd), _clamp_speed(right_rev)],
+            }
+        }
+        _post_json("/", payload)
+
+    def stop(self) -> None:
+        self._send_wheel_motors(0, 0, 0, 0)
+
+    def brake(self) -> None:
+        # In the simulator, fwd+rev together maps to speed=0, matching a hard stop.
+        self._send_wheel_motors(100, 100, 100, 100)
+
+    def forward(self, speed: int) -> None:
+        speed = _clamp_speed(speed)
+        self._send_wheel_motors(speed, 0, speed, 0)
+
+    def reverse(self, speed: int) -> None:
+        speed = _clamp_speed(speed)
+        self._send_wheel_motors(0, speed, 0, speed)
+
+    def spinLeft(self, speed: int) -> None:  # noqa: N802 - keep original API name
+        speed = _clamp_speed(speed)
+        self._send_wheel_motors(0, speed, speed, 0)
+
+    def spinRight(self, speed: int) -> None:  # noqa: N802 - keep original API name
+        speed = _clamp_speed(speed)
+        self._send_wheel_motors(speed, 0, 0, speed)
+
+    def turnForward(self, leftSpeed: int, rightSpeed: int) -> None:  # noqa: N802/N803
+        self._send_wheel_motors(_clamp_speed(leftSpeed), 0, _clamp_speed(rightSpeed), 0)
+
+    def turnReverse(self, leftSpeed: int, rightSpeed: int) -> None:  # noqa: N802/N803
+        self._send_wheel_motors(0, _clamp_speed(leftSpeed), 0, _clamp_speed(rightSpeed))
+
+    # ------------------------------------------------------------------
+    # Servo API
+    # ------------------------------------------------------------------
+
+    def setServo(self, servo: int, degrees: int) -> None:  # noqa: N802
+        servo_id = int(servo)
+        angle = _clamp_servo_angle(degrees)
+        _post_json("/", {"servos": {str(servo_id): angle}})
+
+    def setServos(self, servo_angles: Mapping[int, int]) -> None:  # noqa: N802
+        servos = {
+            str(int(servo)): _clamp_servo_angle(angle)
+            for servo, angle in dict(servo_angles).items()
+        }
+        if servos:
+            _post_json("/", {"servos": servos})
+
+    def stopServo(self, servo: int) -> None:  # noqa: N802
+        # The simulator has no servo PWM hold/release distinction. Keep as no-op.
+        return None
+
+    def stopServos(self) -> None:  # noqa: N802
+        # The simulator has no servo PWM hold/release distinction. Keep as no-op.
+        return None
+
+    def loadOffsets(self) -> None:  # noqa: N802
+        return None
+
+    def saveOffsets(self) -> None:  # noqa: N802
+        return None
+
+    # ------------------------------------------------------------------
+    # Sensors
+    # ------------------------------------------------------------------
+
+    def getDistance(self) -> float:  # noqa: N802
+        """Return simulated ultrasonic distance in cm. 0 means no object/no echo."""
+        # First preference: live simulator endpoint.
+        data = _get_json("/distance")
+        if data is not None:
+            distance = _parse_distance(data.get("distance_cm", data.get("ultrasonicRange")))
+            if distance is not None:
+                return distance
+
+        # Fallback: full state endpoint.
+        data = _get_json("/state")
+        if data is not None:
+            distance = _parse_distance(data.get("distance_cm", data.get("ultrasonicRange")))
+            if distance is not None:
+                return distance
+
+        # Offline fallback for tests: MARSY_SIM_DISTANCE_SEQUENCE="100,80,50,20".
+        sequence = os.getenv("MARSY_SIM_DISTANCE_SEQUENCE", "").strip()
+        if sequence:
+            if not self._last_distance_sequence:
+                values: list[float] = []
+                for part in sequence.split(","):
+                    parsed = _parse_distance(part.strip())
+                    if parsed is not None:
+                        values.append(parsed)
+                self._last_distance_sequence = values or [0.0]
+                self._last_distance_index = 0
+
+            value = self._last_distance_sequence[min(self._last_distance_index, len(self._last_distance_sequence) - 1)]
+            self._last_distance_index += 1
+            return value
+
+        # Offline fallback for tests: MARSY_SIM_DISTANCE_CM=100.
+        env_distance = _parse_distance(os.getenv("MARSY_SIM_DISTANCE_CM"))
+        if env_distance is not None:
+            return env_distance
+
+        return 0.0
+
+    def getBattery(self) -> float:  # noqa: N802
+        data = _get_json("/state")
+        if data is not None:
+            percent = _parse_distance(data.get("battery_percent"))
+            if percent is not None:
+                # Convert fake percent to a plausible 4xAA rover pack voltage.
+                return round(6.0 + (percent / 100.0) * 2.4, 2)
+        return 7.8
+
+    def getSwitch(self) -> bool:  # noqa: N802
+        return False
+
+    def getKey(self) -> int:  # noqa: N802
+        return 0
+
+    # ------------------------------------------------------------------
+    # RGB LED compatibility
+    # ------------------------------------------------------------------
+
+    def fromRGB(self, red: int, green: int, blue: int) -> int:  # noqa: N802
+        return ((int(red) & 0xFF) << 16) + ((int(green) & 0xFF) << 8) + (int(blue) & 0xFF)
+
+    def toRGB(self, color: int) -> tuple[int, int, int]:  # noqa: N802
+        color = int(color)
+        return ((color & 0xFF0000) >> 16, (color & 0x00FF00) >> 8, color & 0x0000FF)
+
+    def setPixel(self, ID: int, color: int) -> None:  # noqa: N802/N803
+        led_id = int(ID)
+        if not 0 <= led_id < self.numPixels:
+            return
+        self._leds[led_id] = list(self.toRGB(color))
+
+    def setColor(self, color: int) -> None:  # noqa: N802
+        rgb = list(self.toRGB(color))
+        for led_id in range(self.numPixels):
+            self._leds[led_id] = rgb[:]
+
+    def show(self) -> None:
+        payload = {
+            "rgbLeds": {
+                str(i): self._leds[i]
+                for i in range(min(self.numPixels, len(self._leds)))
+            }
+        }
+        _post_json("/", payload)
+
+    def clear(self) -> None:
+        self._leds = [[0, 0, 0] for _ in range(self.numPixels)]
+
+    def wheel(self, pos: int) -> int:
+        pos = int(pos) % 256
+        if pos < 85:
+            return self.fromRGB(255 - pos * 3, pos * 3, 0)
+        if pos < 170:
+            pos -= 85
+            return self.fromRGB(0, 255 - pos * 3, pos * 3)
+        pos -= 170
+        return self.fromRGB(pos * 3, 0, 255 - pos * 3)
+
+    def rainbow(self) -> None:
+        for i in range(self.numPixels):
+            self.setPixel(i, self.wheel(int(i * 256 / max(1, self.numPixels))))
+
+    # ------------------------------------------------------------------
+    # Optional helpers for Marsy-specific code
+    # ------------------------------------------------------------------
+
+    def get_state(self) -> Dict[str, Any]:
+        return _get_json("/state") or {}
+
+    def simulator_stop_requested(self) -> bool:
+        state = self.get_state()
+        control = state.get("control", {}) if isinstance(state, dict) else {}
+        return bool(state.get("mission_stop_requested") or control.get("mission_stop_requested"))
+
+    def control(self, action: str, **extra: Any) -> Dict[str, Any]:
+        payload = {"action": action}
+        payload.update(extra)
+        return _post_json("/control", payload) or {}
+
+
+# Object imported by marsy_backends.loader.load_rover().
+rover = SimRover()

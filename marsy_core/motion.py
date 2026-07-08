@@ -1,301 +1,251 @@
 """
-Marsy motion controller.
+Marsy motion abstraction.
 
-High-level movement layer for Marsy.
+Project location:
+    marsy_core/motion.py
 
-This module does not know whether it talks to:
-- the real 4tronix rover.py backend
-- the external simulator backend
-- a future custom Marsy simulator
+This layer exposes logical movement commands for Marsy and hides hardware
+calibration details such as a reversed mast servo on the real rover.
 
-It only expects a rover-like object with methods such as:
-    forward()
-    reverse()
-    stop()
-    brake()
-    spinLeft()
-    spinRight()
-    setServo()
+Important convention:
+    - Logical mast angle < 0 means sensor looks LEFT.
+    - Logical mast angle > 0 means sensor looks RIGHT.
 
-Optional backend method:
-    setServos()
-
-If setServos() exists, wheel steering is sent as one batch command.
-This is useful for the simulator because it avoids several slow HTTP requests.
+The real rover currently has the mast servo mounted in the opposite direction,
+so by default the mast is reversed when MARSY_MODE=real.
+Override with:
+    MARSY_MAST_REVERSED=1   force reversed mast
+    MARSY_MAST_REVERSED=0   force normal mast
 """
 
+from __future__ import annotations
 
-# ---------------------------------------------------------------------
-# Servo mapping for 4tronix M.A.R.S. Rover
-# ---------------------------------------------------------------------
+import os
 
+
+# Servo channels used by the original 4tronix library.
 SERVO_MAST = 0
+SERVO_FL = 9
+SERVO_RL = 11
+SERVO_RR = 13
+SERVO_FR = 15
 
-SERVO_FL = 9    # Front left wheel steering servo
-SERVO_RL = 11   # Rear left wheel steering servo
-SERVO_RR = 13   # Rear right wheel steering servo
-SERVO_FR = 15   # Front right wheel steering servo
 
-
-# ---------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------
-
-def clamp_speed(speed):
-    """
-    Clamp motor speed to 0..100.
-    """
+def clamp_speed(speed: int | float) -> int:
+    """Clamp rover speed to the 0..100 range used by the 4tronix API."""
     return int(max(0, min(100, speed)))
 
 
-def clamp_angle(angle):
-    """
-    Clamp servo angle to -90..90.
-    """
+def clamp_angle(angle: int | float) -> int:
+    """Clamp logical servo angle to the conservative -90..90 range."""
     return int(max(-90, min(90, angle)))
 
 
-# ---------------------------------------------------------------------
-# Motion controller
-# ---------------------------------------------------------------------
+def _env_bool(name: str, default: bool = False) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on", "y"}
+
+
+def _env_float(name: str, default: float) -> float:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    try:
+        return float(value)
+    except ValueError:
+        return default
+
+
+def _default_mast_reversed() -> bool:
+    """
+    Default mast calibration.
+
+    Our real Marsy mast is physically reversed. The simulator is not.
+    Explicit MARSY_MAST_REVERSED always wins.
+    """
+    if os.getenv("MARSY_MAST_REVERSED") is not None:
+        return _env_bool("MARSY_MAST_REVERSED", default=False)
+
+    return os.getenv("MARSY_MODE", "sim").strip().lower() == "real"
+
 
 class MarsyMotion:
+    """
+    High-level logical motion API.
+
+    Mission/behavior code should use this class instead of calling rover.py
+    directly. This lets the same behavior work in simulation and on the real
+    rover even when hardware calibration differs.
+    """
+
     def __init__(self, rover):
         self.rover = rover
 
-    # -----------------------------------------------------------------
-    # Low-level wheel servo control
-    # -----------------------------------------------------------------
+        # Mast calibration.
+        # Logical left/right remains stable; only the servo command is inverted.
+        self.mast_reversed = _default_mast_reversed()
+        self.mast_center_offset_deg = _env_float("MARSY_MAST_CENTER_OFFSET_DEG", 0.0)
+        self.mast_min_deg = _env_float("MARSY_MAST_MIN_DEG", -90.0)
+        self.mast_max_deg = _env_float("MARSY_MAST_MAX_DEG", 90.0)
 
-    def set_wheel_servos(self, fl, fr, rl, rr):
+    # ------------------------------------------------------------------
+    # Generic helpers
+    # ------------------------------------------------------------------
+
+    def _set_servo(self, servo: int, angle: int | float) -> None:
+        self.rover.setServo(servo, int(round(angle)))
+
+    def _mast_servo_angle(self, logical_angle: int | float) -> int:
         """
-        Set all four wheel steering servos.
+        Convert logical mast angle to physical servo command.
 
-        If backend supports setServos(), send all wheel angles in one batch.
-        Otherwise fall back to four standard setServo() calls.
+        logical_angle:
+            - negative -> sensor looks LEFT
+            - positive -> sensor looks RIGHT
 
-        Args:
-            fl: front-left wheel angle
-            fr: front-right wheel angle
-            rl: rear-left wheel angle
-            rr: rear-right wheel angle
+        If the mast servo is reversed, invert the command here only.
         """
+        logical_angle = clamp_angle(logical_angle)
+
+        if self.mast_reversed:
+            logical_angle = -logical_angle
+
+        physical_angle = self.mast_center_offset_deg + logical_angle
+        physical_angle = max(self.mast_min_deg, min(self.mast_max_deg, physical_angle))
+        return int(round(physical_angle))
+
+    def mast_debug_config(self) -> dict:
+        """Return current mast calibration for debug output."""
+        return {
+            "mast_reversed": self.mast_reversed,
+            "mast_center_offset_deg": self.mast_center_offset_deg,
+            "mast_min_deg": self.mast_min_deg,
+            "mast_max_deg": self.mast_max_deg,
+        }
+
+    # ------------------------------------------------------------------
+    # Wheel steering servos
+    # ------------------------------------------------------------------
+
+    def set_wheel_servos(self, fl: int, fr: int, rl: int, rr: int) -> None:
         fl = clamp_angle(fl)
         fr = clamp_angle(fr)
         rl = clamp_angle(rl)
         rr = clamp_angle(rr)
 
+        # Simulator backend supports batch servo updates. The real 4tronix API
+        # may not, so fall back to individual setServo calls.
         if hasattr(self.rover, "setServos"):
-            self.rover.setServos({
-                SERVO_FL: fl,
-                SERVO_FR: fr,
-                SERVO_RL: rl,
-                SERVO_RR: rr,
-            })
+            self.rover.setServos(
+                {
+                    SERVO_FL: fl,
+                    SERVO_FR: fr,
+                    SERVO_RL: rl,
+                    SERVO_RR: rr,
+                }
+            )
             return
 
-        self.rover.setServo(SERVO_FL, fl)
-        self.rover.setServo(SERVO_FR, fr)
-        self.rover.setServo(SERVO_RL, rl)
-        self.rover.setServo(SERVO_RR, rr)
+        self._set_servo(SERVO_FL, fl)
+        self._set_servo(SERVO_FR, fr)
+        self._set_servo(SERVO_RL, rl)
+        self._set_servo(SERVO_RR, rr)
 
-    def wheels_straight(self):
-        """
-        Set all steering wheels straight.
-        """
+    def wheels_straight(self) -> None:
         self.set_wheel_servos(0, 0, 0, 0)
 
-    def steer_left(self, angle=20):
-        """
-        Steer wheels for left arc movement.
-
-        Same convention as the original 4tronix driveRover.py:
-            front wheels: -angle
-            rear wheels:  +angle
-        """
+    def steer_left(self, angle: int = 20) -> None:
         angle = clamp_angle(angle)
-        self.set_wheel_servos(
-            fl=-angle,
-            fr=-angle,
-            rl=angle,
-            rr=angle,
-        )
+        self.set_wheel_servos(fl=-angle, fr=-angle, rl=angle, rr=angle)
 
-    def steer_right(self, angle=20):
-        """
-        Steer wheels for right arc movement.
-
-        Same convention as the original 4tronix driveRover.py:
-            front wheels: +angle
-            rear wheels:  -angle
-        """
+    def steer_right(self, angle: int = 20) -> None:
         angle = clamp_angle(angle)
-        self.set_wheel_servos(
-            fl=angle,
-            fr=angle,
-            rl=-angle,
-            rr=-angle,
-        )
+        self.set_wheel_servos(fl=angle, fr=angle, rl=-angle, rr=-angle)
 
-    # -----------------------------------------------------------------
-    # Motor movement
-    # -----------------------------------------------------------------
+    # ------------------------------------------------------------------
+    # Drive motors
+    # ------------------------------------------------------------------
 
-    def forward(self, speed=60, straighten=True):
-        """
-        Move forward.
-
-        By default, straighten wheels before driving.
-        For manual driving, you may want straighten=False so Marsy keeps
-        the current steering angle.
-        """
+    def forward(self, speed: int = 60, straighten: bool = True) -> None:
         speed = clamp_speed(speed)
-
         if straighten:
             self.wheels_straight()
-
         self.rover.forward(speed)
 
-    def reverse(self, speed=60, straighten=True):
-        """
-        Move backward.
-
-        By default, straighten wheels before reversing.
-        """
+    def reverse(self, speed: int = 60, straighten: bool = True) -> None:
         speed = clamp_speed(speed)
-
         if straighten:
             self.wheels_straight()
-
         self.rover.reverse(speed)
 
-    def stop(self):
-        """
-        Coast stop.
-        """
+    def stop(self) -> None:
         self.rover.stop()
 
-    def brake(self):
-        """
-        Quick brake.
-        """
+    def brake(self) -> None:
         self.rover.brake()
 
-    def spin_left(self, speed=50):
-        """
-        Spin left in place using opposite wheel directions.
+    def spin_left(self, speed: int = 50) -> None:
+        self.rover.spinLeft(clamp_speed(speed))
 
-        This does not visibly steer the wheel servos.
-        """
-        speed = clamp_speed(speed)
-        self.rover.spinLeft(speed)
+    def spin_right(self, speed: int = 50) -> None:
+        self.rover.spinRight(clamp_speed(speed))
 
-    def spin_right(self, speed=50):
-        """
-        Spin right in place using opposite wheel directions.
+    def turn_forward(self, left_speed: int, right_speed: int) -> None:
+        self.rover.turnForward(clamp_speed(left_speed), clamp_speed(right_speed))
 
-        This does not visibly steer the wheel servos.
-        """
-        speed = clamp_speed(speed)
-        self.rover.spinRight(speed)
+    def turn_reverse(self, left_speed: int, right_speed: int) -> None:
+        self.rover.turnReverse(clamp_speed(left_speed), clamp_speed(right_speed))
 
-    def turn_forward(self, left_speed, right_speed):
-        """
-        Drive forward with different left/right motor speeds.
-        """
-        left_speed = clamp_speed(left_speed)
-        right_speed = clamp_speed(right_speed)
-        self.rover.turnForward(left_speed, right_speed)
-
-    def turn_reverse(self, left_speed, right_speed):
-        """
-        Drive backward with different left/right motor speeds.
-        """
-        left_speed = clamp_speed(left_speed)
-        right_speed = clamp_speed(right_speed)
-        self.rover.turnReverse(left_speed, right_speed)
-
-    # -----------------------------------------------------------------
-    # Combined arc helpers
-    # -----------------------------------------------------------------
-
-    def forward_left(self, speed=50, angle=20):
-        """
-        Steer left and move forward.
-        """
+    def forward_left(self, speed: int = 50, angle: int = 20) -> None:
         self.steer_left(angle)
         self.rover.forward(clamp_speed(speed))
 
-    def forward_right(self, speed=50, angle=20):
-        """
-        Steer right and move forward.
-        """
+    def forward_right(self, speed: int = 50, angle: int = 20) -> None:
         self.steer_right(angle)
         self.rover.forward(clamp_speed(speed))
 
-    def reverse_left(self, speed=50, angle=20):
-        """
-        Steer left and reverse.
-        """
+    def reverse_left(self, speed: int = 50, angle: int = 20) -> None:
         self.steer_left(angle)
         self.rover.reverse(clamp_speed(speed))
 
-    def reverse_right(self, speed=50, angle=20):
-        """
-        Steer right and reverse.
-        """
+    def reverse_right(self, speed: int = 50, angle: int = 20) -> None:
         self.steer_right(angle)
         self.rover.reverse(clamp_speed(speed))
 
-    # -----------------------------------------------------------------
-    # Mast servo
-    # -----------------------------------------------------------------
+    # ------------------------------------------------------------------
+    # Mast-mounted ultrasonic sensor
+    # ------------------------------------------------------------------
 
-    def mast_center(self):
-        """
-        Center mast/head servo.
-        """
-        self.rover.setServo(SERVO_MAST, 0)
+    def mast_center(self) -> None:
+        # Logical center is always 0; calibration offset is applied internally.
+        self.mast_to(0)
 
-    def mast_left(self, angle=45):
-        """
-        Rotate mast/head left.
-        """
-        self.rover.setServo(SERVO_MAST, -clamp_angle(angle))
+    def mast_left(self, angle: int = 45) -> None:
+        # Logical left is negative. Hardware inversion is handled in mast_to().
+        self.mast_to(-abs(clamp_angle(angle)))
 
-    def mast_right(self, angle=45):
-        """
-        Rotate mast/head right.
-        """
-        self.rover.setServo(SERVO_MAST, clamp_angle(angle))
+    def mast_right(self, angle: int = 45) -> None:
+        # Logical right is positive. Hardware inversion is handled in mast_to().
+        self.mast_to(abs(clamp_angle(angle)))
 
-    def mast_to(self, angle):
-        """
-        Set mast/head to an explicit angle.
-        """
-        self.rover.setServo(SERVO_MAST, clamp_angle(angle))
+    def mast_to(self, logical_angle: int | float) -> None:
+        servo_angle = self._mast_servo_angle(logical_angle)
+        self._set_servo(SERVO_MAST, servo_angle)
 
-    # -----------------------------------------------------------------
-    # Safe reset helpers
-    # -----------------------------------------------------------------
+    # ------------------------------------------------------------------
+    # Safe convenience poses
+    # ------------------------------------------------------------------
 
-    def reset_pose(self):
-        """
-        Reset steering wheels and mast to neutral positions.
-        """
+    def reset_pose(self) -> None:
         self.wheels_straight()
         self.mast_center()
 
-    def stop_and_reset(self):
-        """
-        Stop motors and reset servos to neutral positions.
-        """
+    def stop_and_reset(self) -> None:
         self.stop()
         self.reset_pose()
 
-    def brake_and_reset(self):
-        """
-        Brake motors and reset servos to neutral positions.
-        """
+    def brake_and_reset(self) -> None:
         self.brake()
         self.reset_pose()
