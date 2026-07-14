@@ -5,6 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Marsy Real Dashboard</title>
   <link rel="stylesheet" href="/static/style.css" />
+  <link rel="stylesheet" href="/static/missions.css" />
 </head>
 <body>
   <header class="topbar">
@@ -13,9 +14,7 @@
       <h1>Marsy Real Dashboard</h1>
     </div>
     <div class="top-actions">
-      <button id="startAvoidBtn" class="accent-button mission-button">Start Obstacle Avoidance</button>
-      <button id="manualModeBtn" class="mission-button">Manual UI Mode</button>
-      <button id="stopMissionBtn" class="mission-button">Stop Mission</button>
+      <button type="button" class="mission-button" onclick="window.location.href='/maps'">Maps</button>
       <button id="shutdownBtn" class="shutdown-button top-shutdown-button">Shutdown dashboard</button>
       <button id="stopBtn" class="stop-button">STOP</button>
     </div>
@@ -26,7 +25,6 @@
       <section class="panel-section">
         <div class="section-title">Manual drive</div>
         <div class="hint">Keyboard: W/S or ↑/↓ drive · A/D or ←/→ steer · Space = STOP</div>
-
         <label class="slider-label">Speed <strong id="speedValue">30</strong>
           <input id="speed" type="range" min="0" max="70" value="30" />
         </label>
@@ -38,11 +36,9 @@
           <button class="drive hold" data-command="forward_left" aria-label="Forward left">↖</button>
           <button class="drive hold" data-command="forward" aria-label="Forward">▲</button>
           <button class="drive hold" data-command="forward_right" aria-label="Forward right">↗</button>
-
           <button class="drive" data-command="steer_left" aria-label="Steer wheels left">◀</button>
           <button class="drive brake" data-command="brake" aria-label="Brake">Brake</button>
           <button class="drive" data-command="steer_right" aria-label="Steer wheels right">▶</button>
-
           <button class="drive hold" data-command="reverse_left" aria-label="Reverse left">↙</button>
           <button class="drive hold" data-command="reverse" aria-label="Reverse">▼</button>
           <button class="drive hold" data-command="reverse_right" aria-label="Reverse right">↘</button>
@@ -56,7 +52,6 @@
 
       <section class="panel-section lidar-section">
         <div class="section-title">LiDAR / range mast</div>
-
         <label class="slider-label">Mast angle <strong id="mastValue">45°</strong>
           <input id="mastAngle" type="range" min="0" max="81" value="45" />
         </label>
@@ -74,12 +69,12 @@
           <button data-lidar-to="30">30°</button>
           <button data-lidar-to="60">60°</button>
         </div>
+
         <div class="button-grid two compact">
           <button id="lidarScanBtn">Scan L/C/R</button>
           <button id="lidarSweepBtn">Sweep scan</button>
         </div>
-
-        <div class="scan-readout" id="lidarReadout">Distance: —</div>
+        <div class="hud-output-hint">Scan results appear on the camera arc.</div>
       </section>
     </aside>
 
@@ -93,38 +88,100 @@
       </div>
       <div class="camera-frame">
         <img id="cameraFeed" src="/video.mjpg" alt="Marsy camera stream" />
-        <div class="camera-crosshair"></div>
+
+        <div id="cameraErrorHud" class="camera-error-hud" role="status" aria-live="polite" aria-hidden="true">
+          <span class="camera-error-dot" aria-hidden="true"></span>
+          <div>
+            <div class="camera-error-title">Error</div>
+            <div id="cameraErrorMessage" class="camera-error-message"></div>
+          </div>
+        </div>
+
+        <div id="rangeHud" class="range-hud" aria-label="Obstacle distance arc">
+          <svg class="range-hud-svg" viewBox="0 0 1000 260" preserveAspectRatio="none" aria-hidden="true">
+            <defs>
+              <linearGradient id="rangeHudFill" x1="0" y1="0" x2="0" y2="1">
+                <stop offset="0%" stop-color="#13191d" stop-opacity="0.72" />
+                <stop offset="100%" stop-color="#080b0d" stop-opacity="0.94" />
+              </linearGradient>
+            </defs>
+            <path class="range-hud-fill" d="M0 260 L0 220 Q500 12 1000 220 L1000 260 Z" />
+            <path class="range-hud-arc" d="M0 220 Q500 12 1000 220" />
+            <path class="range-hud-arc range-hud-arc-secondary" d="M0 258 Q500 63 1000 258" />
+          </svg>
+
+          <div class="range-marker range-marker-far-left" data-range-slot="far_left">
+            <span class="range-label">FAR L</span><strong class="range-value">—</strong><span class="range-dot"></span>
+          </div>
+          <div class="range-marker range-marker-left" data-range-slot="left">
+            <span class="range-label">L</span><strong class="range-value">—</strong><span class="range-dot"></span>
+          </div>
+          <div class="range-marker range-marker-half-left" data-range-slot="half_left">
+            <span class="range-label">HALF L</span><strong class="range-value">—</strong><span class="range-dot"></span>
+          </div>
+          <div class="range-marker range-marker-center is-center" data-range-slot="center">
+            <span class="range-label">C</span><strong class="range-value">—</strong><span class="range-dot"></span>
+          </div>
+          <div class="range-marker range-marker-half-right" data-range-slot="half_right">
+            <span class="range-label">HALF R</span><strong class="range-value">—</strong><span class="range-dot"></span>
+          </div>
+          <div class="range-marker range-marker-right" data-range-slot="right">
+            <span class="range-label">R</span><strong class="range-value">—</strong><span class="range-dot"></span>
+          </div>
+          <div class="range-marker range-marker-far-right" data-range-slot="far_right">
+            <span class="range-label">FAR R</span><strong class="range-value">—</strong><span class="range-dot"></span>
+          </div>
+        </div>
       </div>
     </section>
 
     <aside class="panel right-panel">
-      <section class="panel-section">
-        <div class="section-title">Telemetry</div>
-        <dl class="telemetry-grid">
-          <div><dt>Error</dt><dd id="lastError">—</dd></div>
-        </dl>
-      </section>
+      <nav class="right-tabs" role="tablist" aria-label="Dashboard information">
+        <button type="button" class="right-tab-button active" role="tab" aria-selected="true" data-right-tab="telemetry">Status</button>
+        <button type="button" class="right-tab-button" role="tab" aria-selected="false" data-right-tab="missions">Missions</button>
+        <button type="button" class="right-tab-button" role="tab" aria-selected="false" data-right-tab="logs">Log</button>
+      </nav>
 
-      <section class="panel-section">
-        <div class="section-title">Obstacle avoidance</div>
-        <label class="slider-label">Safe distance <strong id="safeDistanceValue">55 cm</strong>
-          <input id="safeDistance" type="range" min="20" max="120" value="55" />
-        </label>
-        <label class="slider-label">Danger distance <strong id="dangerDistanceValue">35 cm</strong>
-          <input id="dangerDistance" type="range" min="10" max="90" value="35" />
-        </label>
-        <label class="text-label">Run seconds, optional
-          <input id="runSeconds" type="number" min="1" step="1" placeholder="empty = until stopped" />
-        </label>
-      </section>
+      <div class="right-tab-stack">
+        <section id="right-tab-telemetry" class="right-tab-panel active" role="tabpanel" data-right-panel="telemetry">
+          <div class="distance-threshold-settings">
+            <div class="mission-subtitle">Obstacle distance thresholds</div>
+            <label class="slider-label">
+              Safe distance <strong id="safeDistanceValue">55 cm</strong>
+              <input id="safeDistance" type="range" min="20" max="150" step="1" value="55" />
+            </label>
+            <label class="slider-label">
+              Danger distance <strong id="dangerDistanceValue">35 cm</strong>
+              <input id="dangerDistance" type="range" min="10" max="100" step="1" value="35" />
+            </label>
+            <div class="hint">These thresholds colour the camera arc and protect manual forward driving.</div>
+          </div>
+          <input id="runSeconds" type="hidden" value="" />
+        </section>
 
-      <section class="panel-section logs-section">
-        <div class="section-title">Telemetry log</div>
-        <pre id="logs" class="logs">Waiting for telemetry...</pre>
-      </section>
+        <section id="right-tab-missions" class="right-tab-panel" role="tabpanel" data-right-panel="missions" hidden>
+          <div class="mission-section-header">
+            <div>
+              <div class="section-title">Available missions</div>
+              <div class="hint">Each mission has its own parameters and controls.</div>
+            </div>
+            <span id="missionStatePill" class="pill">loading</span>
+          </div>
+          <div id="activeMissionSummary" class="active-mission-summary">No mission running</div>
+          <div id="missionSelector" class="mission-selector" role="tablist" aria-label="Available missions"></div>
+          <div id="missionList" class="mission-list" aria-live="polite">Loading missions...</div>
+        </section>
+
+        <section id="right-tab-logs" class="right-tab-panel logs-tab-panel" role="tabpanel" data-right-panel="logs" hidden>
+          <div class="section-title">Telemetry log</div>
+          <div class="hint">Most recent dashboard and mission events.</div>
+          <pre id="logs" class="logs">Waiting for telemetry...</pre>
+        </section>
+      </div>
     </aside>
   </main>
 
   <script src="/static/app.js"></script>
+  <script src="/static/missions.js"></script>
 </body>
 </html>

@@ -92,7 +92,6 @@ class CameraStream:
         self.rotation_deg = _normalise_rotation(rotation_deg)
         self._lock = threading.Lock()
         self._picam2 = None
-        self._closed = threading.Event()
         self._status = CameraStatus(
             available=False,
             backend="placeholder",
@@ -121,8 +120,6 @@ class CameraStream:
 
     def start(self) -> None:
         with self._lock:
-            if self._closed.is_set():
-                return
             if self._started:
                 return
             self._started = True
@@ -149,42 +146,23 @@ class CameraStream:
                 )
 
     def stop(self) -> None:
-        """Stop the camera permanently for this dashboard process.
-
-        This is called during server shutdown. The flag is intentionally
-        permanent: existing MJPEG request threads must not re-open Picamera2
-        after cleanup has already run.
-        """
-        self._closed.set()
         with self._lock:
-            picam2 = self._picam2
+            if self._picam2 is not None:
+                try:
+                    self._picam2.stop()
+                except Exception:
+                    pass
             self._picam2 = None
             self._started = False
-
-        if picam2 is not None:
-            try:
-                picam2.stop()
-            except Exception:
-                pass
-            try:
-                close = getattr(picam2, "close", None)
-                if callable(close):
-                    close()
-            except Exception:
-                pass
-
-        with self._lock:
             self._status = CameraStatus(
                 available=False,
-                backend="stopped",
+                backend="placeholder",
                 rotation_deg=self.rotation_deg,
                 rotation_backend="software-array" if self.rotation_deg else "none",
                 frame_size=f"{self.width}x{self.height}",
             )
 
     def capture_jpeg(self) -> bytes:
-        if self._closed.is_set():
-            return _PLACEHOLDER_JPEG
         self.start()
         if self._picam2 is None:
             return _PLACEHOLDER_JPEG
@@ -203,10 +181,8 @@ class CameraStream:
 
     def mjpeg_frames(self) -> Iterator[bytes]:
         interval = 1.0 / self.fps
-        while not self._closed.is_set():
+        while True:
             frame = self.capture_jpeg()
-            if self._closed.is_set():
-                break
             yield (
                 b"--marsyframe\r\n"
                 b"Content-Type: image/jpeg\r\n"

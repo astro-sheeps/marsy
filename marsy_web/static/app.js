@@ -1,13 +1,10 @@
 const stateEls = {
-  distance: document.getElementById('distance'),
-  battery: document.getElementById('battery'),
-  heartbeat: document.getElementById('heartbeat'),
-  lastCommand: document.getElementById('lastCommand'),
   lastError: document.getElementById('lastError'),
-  modePill: document.getElementById('modePill'),
+  cameraErrorHud: document.getElementById('cameraErrorHud'),
+  cameraErrorMessage: document.getElementById('cameraErrorMessage'),
   cameraStatus: document.getElementById('cameraStatus'),
   logs: document.getElementById('logs'),
-  lidarReadout: document.getElementById('lidarReadout'),
+  rangeHud: document.getElementById('rangeHud'),
 };
 
 function setText(el, value) {
@@ -28,26 +25,144 @@ const controls = {
   runSeconds: document.getElementById('runSeconds'),
 };
 
+const RANGE_SLOTS = [
+  { key: 'far_left', angle: -75 },
+  { key: 'left', angle: -50 },
+  { key: 'half_left', angle: -25 },
+  { key: 'center', angle: 0 },
+  { key: 'half_right', angle: 25 },
+  { key: 'right', angle: 50 },
+  { key: 'far_right', angle: 75 },
+];
+
+const rangeValues = Object.fromEntries(
+  RANGE_SLOTS.map(({ key }) => [key, { distance: null, quality: 'unmeasured' }]),
+);
+const rangeMarkers = Object.fromEntries(
+  Array.from(document.querySelectorAll('[data-range-slot]')).map((marker) => [marker.dataset.rangeSlot, marker]),
+);
+
 let activeHoldButton = null;
 let lastKeyboardCommand = null;
 let shuttingDown = false;
-let lastScanText = '';
+let rangeHudBusy = false;
+let missionRangeHudBusy = false;
+let activeSweepId = null;
 
-function refreshLidarReadout(currentDistanceText = null) {
-  const distanceLine = currentDistanceText ?? `Distance: ${formatDistance(null)}`;
-  const content = lastScanText ? `${distanceLine}\n\n${lastScanText}` : distanceLine;
-  setText(stateEls.lidarReadout, content);
+function numericDistance(value) {
+  if (value === null || value === undefined || value === '') return null;
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : null;
 }
 
+function formatDistance(entry) {
+  const quality = entry?.quality || 'unmeasured';
+  if (quality === 'unmeasured') return '—';
+  if (quality !== 'measured') return '?';
+  const n = numericDistance(entry?.distance);
+  return n === null ? '?' : `${Math.round(n)} cm`;
+}
+
+function nearestRangeSlot(angleDeg) {
+  const angle = Number(angleDeg);
+  if (!Number.isFinite(angle)) return RANGE_SLOTS[3];
+  return RANGE_SLOTS.reduce((best, slot) => (
+    Math.abs(slot.angle - angle) < Math.abs(best.angle - angle) ? slot : best
+  ));
+}
+
+function clearRangeValues() {
+  for (const slot of RANGE_SLOTS) {
+    rangeValues[slot.key] = { distance: null, quality: 'unmeasured' };
+  }
+}
+
+function setRangeValue(slotKey, value, quality = null) {
+  if (!(slotKey in rangeValues)) return;
+  const distance = numericDistance(value);
+  rangeValues[slotKey] = {
+    distance,
+    quality: quality || (distance === null ? 'unknown' : 'measured'),
+  };
+}
+
+function distanceSeverity(entry) {
+  if (!entry || entry.quality !== 'measured') return 'unknown';
+  const distance = numericDistance(entry.distance);
+  if (distance === null || distance <= 0) return 'unknown';
+  const danger = Number(controls.dangerDistance?.value || 35);
+  const safe = Number(controls.safeDistance?.value || 55);
+  if (distance < danger) return 'danger';
+  if (distance < safe) return 'warning';
+  return 'clear';
+}
+
+function renderRangeHud() {
+  for (const slot of RANGE_SLOTS) {
+    const marker = rangeMarkers[slot.key];
+    if (!marker) continue;
+    const entry = rangeValues[slot.key];
+    const valueEl = marker.querySelector('.range-value');
+    setText(valueEl, formatDistance(entry));
+    marker.classList.remove('range-unknown', 'range-clear', 'range-warning', 'range-danger');
+    marker.classList.add(`range-${distanceSeverity(entry)}`);
+  }
+  stateEls.rangeHud?.classList.toggle('is-scanning', rangeHudBusy || missionRangeHudBusy);
+}
+
+function applyLidarScan(scan) {
+  if (!scan) return;
+  missionRangeHudBusy = Boolean(scan.scanning);
+
+  if (scan.kind === 'sweep' && Array.isArray(scan.samples)) {
+    const sweepId = scan.scan_id || null;
+    if (sweepId && sweepId !== activeSweepId) {
+      activeSweepId = sweepId;
+      clearRangeValues();
+    }
+    for (const sample of scan.samples) {
+      const slot = nearestRangeSlot(sample.angle_deg);
+      const quality = sample.quality || (sample.no_echo ? 'no_echo' : 'measured');
+      setRangeValue(slot.key, sample.distance_cm, quality);
+    }
+    renderRangeHud();
+    return;
+  }
+
+  if (scan.kind === 'triad' && scan.distances) {
+    // Keep the most recent outer sweep points and refresh the three
+    // directions measured by obstacle avoidance.
+    setRangeValue('left', scan.distances.left, scan.distances.left == null ? 'unknown' : 'measured');
+    setRangeValue('center', scan.distances.center, scan.distances.center == null ? 'unknown' : 'measured');
+    setRangeValue('right', scan.distances.right, scan.distances.right == null ? 'unknown' : 'measured');
+    renderRangeHud();
+    return;
+  }
+
+  if (scan.kind === 'point') {
+    const slot = nearestRangeSlot(scan.angle_deg);
+    setRangeValue(slot.key, scan.distance_cm, scan.distance_cm == null ? 'unknown' : 'measured');
+    renderRangeHud();
+  }
+}
+
+function renderError(errorValue) {
+  const hasError = Boolean(errorValue && String(errorValue).trim() && String(errorValue).trim() !== '—');
+  const text = hasError ? String(errorValue) : '';
+  setText(stateEls.lastError, text);
+  setText(stateEls.cameraErrorMessage, text);
+  stateEls.cameraErrorHud?.classList.toggle('has-error', hasError);
+  stateEls.cameraErrorHud?.setAttribute('aria-hidden', hasError ? 'false' : 'true');
+}
 
 function commandPayload(command) {
   return {
     command,
-    speed: Number(controls.speed.value),
-    steer_angle: Number(controls.steerAngle.value),
-    mast_angle: Number(controls.mastAngle.value),
-    safe_distance: Number(controls.safeDistance.value),
-    danger_distance: Number(controls.dangerDistance.value),
+    speed: Number(controls.speed?.value || 30),
+    steer_angle: Number(controls.steerAngle?.value || 24),
+    mast_angle: Number(controls.mastAngle?.value || 45),
+    safe_distance: Number(controls.safeDistance?.value || 55),
+    danger_distance: Number(controls.dangerDistance?.value || 35),
   };
 }
 
@@ -57,71 +172,28 @@ async function postJSON(url, payload = {}) {
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(payload),
   });
-  if (!response.ok) {
-    throw new Error(`${url} failed: ${response.status}`);
-  }
+  if (!response.ok) throw new Error(`${url} failed: ${response.status}`);
   return response.json();
 }
 
 async function getJSON(url) {
   const response = await fetch(url, { cache: 'no-store' });
-  if (!response.ok) {
-    throw new Error(`${url} failed: ${response.status}`);
-  }
+  if (!response.ok) throw new Error(`${url} failed: ${response.status}`);
   return response.json();
 }
 
-function formatDistance(value) {
-  if (value === null || value === undefined) return '—';
-  const n = Number(value);
-  if (!Number.isFinite(n)) return '—';
-  if (n === 0) return 'no echo';
-  return `${n.toFixed(1)} cm`;
-}
-
-function formatBattery(value) {
-  if (value === null || value === undefined) return '—';
-  const n = Number(value);
-  if (!Number.isFinite(n)) return '—';
-  return `${n.toFixed(2)} V`;
-}
-
-function renderScan(scan) {
-  if (!scan) return;
-  if (scan.kind === 'sweep' && Array.isArray(scan.samples)) {
-    const lines = scan.samples.map((s) => `${String(s.angle_deg).padStart(4)}°  ${formatDistance(s.distance_cm)}`);
-    lastScanText = lines.join('\n');
-    return;
-  }
-  if (scan.kind === 'triad' && scan.distances) {
-    const d = scan.distances;
-    lastScanText = [
-      `left   ${formatDistance(d.left)}`,
-      `center ${formatDistance(d.center)}`,
-      `right  ${formatDistance(d.right)}`,
-    ].join('\n');
-    return;
-  }
-  if (scan.kind === 'point') {
-    lastScanText = `${scan.angle_deg}°  ${formatDistance(scan.distance_cm)}`;
-  }
-}
-
 function updateState(data) {
-  setText(stateEls.distance, formatDistance(data.distance_cm));
-  setText(stateEls.battery, formatBattery(data.battery_v));
-  setText(stateEls.heartbeat, data.last_heartbeat_age_s === null || data.last_heartbeat_age_s === undefined
-    ? '—'
-    : `${Number(data.last_heartbeat_age_s).toFixed(2)} s`);
-  setText(stateEls.lastCommand, data.last_command ?? '—');
-  setText(stateEls.lastError, data.last_error ?? '—');
-  setText(stateEls.modePill, data.mode ?? 'manual');
+  renderError(data.last_error);
   setText(stateEls.cameraStatus, data.camera?.available ? 'camera online' : (data.camera?.error || 'no camera'));
 
-  if (data.lidar_scan) {
-    renderScan(data.lidar_scan);
+  if (data.lidar_scan) applyLidarScan(data.lidar_scan);
+  // The continuously polled front measurement belongs to the centre marker.
+  const exploreRunning = Boolean(data.mission?.running && data.mission?.name === 'explore_area');
+  const frontDistance = numericDistance(data.distance_cm);
+  if (!exploreRunning && frontDistance !== null && frontDistance > 0 && frontDistance <= 400) {
+    setRangeValue('center', frontDistance, 'measured');
+    renderRangeHud();
   }
-  refreshLidarReadout(`Distance: ${formatDistance(data.distance_cm)}`);
 
   const logs = data.logs || [];
   if (stateEls.logs) {
@@ -136,13 +208,21 @@ async function sendCommand(command) {
 }
 
 async function sendLidar(action, extra = {}) {
-  setText(stateEls.lidarReadout, 'Scanning...');
-  const data = await postJSON('/api/lidar', {
-    action,
-    mast_angle: Number(controls.mastAngle.value),
-    ...extra,
-  });
-  updateState(data);
+  rangeHudBusy = true;
+  renderRangeHud();
+  try {
+    const data = await postJSON('/api/lidar', {
+      action,
+      mast_angle: Number(controls.mastAngle?.value || 45),
+      safe_distance: Number(controls.safeDistance?.value || 55),
+      danger_distance: Number(controls.dangerDistance?.value || 35),
+      ...extra,
+    });
+    updateState(data);
+  } finally {
+    rangeHudBusy = false;
+    renderRangeHud();
+  }
 }
 
 async function emergencyStop() {
@@ -151,17 +231,16 @@ async function emergencyStop() {
 }
 
 async function startAvoidObstacle() {
+  const speed = Number(controls.speed?.value || 30);
   const payload = {
     mission: 'avoid_obstacle',
-    forward_speed: Number(controls.speed.value),
-    turn_speed: Number(controls.speed.value),
-    reverse_speed: Math.max(10, Math.round(Number(controls.speed.value) * 0.75)),
-    safe_distance: Number(controls.safeDistance.value),
-    danger_distance: Number(controls.dangerDistance.value),
+    forward_speed: speed,
+    turn_speed: speed,
+    reverse_speed: Math.max(10, Math.round(speed * 0.75)),
+    safe_distance: Number(controls.safeDistance?.value || 55),
+    danger_distance: Number(controls.dangerDistance?.value || 35),
   };
-  if (controls.runSeconds.value) {
-    payload.run_seconds = Number(controls.runSeconds.value);
-  }
+  if (controls.runSeconds?.value) payload.run_seconds = Number(controls.runSeconds.value);
   const data = await postJSON('/api/mission/start', payload);
   updateState(data);
 }
@@ -171,12 +250,22 @@ async function stopMission() {
   updateState(data);
 }
 
-function updateSliderLabels() {
-  controls.speedValue.textContent = controls.speed.value;
-  controls.steerValue.textContent = `${controls.steerAngle.value}°`;
-  controls.mastValue.textContent = `${controls.mastAngle.value}°`;
-  controls.safeDistanceValue.textContent = `${controls.safeDistance.value} cm`;
-  controls.dangerDistanceValue.textContent = `${controls.dangerDistance.value} cm`;
+function updateSliderLabels(event) {
+  if (controls.safeDistance && controls.dangerDistance) {
+    const safe = Number(controls.safeDistance.value || 55);
+    const danger = Number(controls.dangerDistance.value || 35);
+    if (event?.target === controls.safeDistance && danger > safe) {
+      controls.dangerDistance.value = String(safe);
+    } else if (event?.target === controls.dangerDistance && danger > safe) {
+      controls.safeDistance.value = String(danger);
+    }
+  }
+  if (controls.speedValue && controls.speed) controls.speedValue.textContent = controls.speed.value;
+  if (controls.steerValue && controls.steerAngle) controls.steerValue.textContent = `${controls.steerAngle.value}°`;
+  if (controls.mastValue && controls.mastAngle) controls.mastValue.textContent = `${controls.mastAngle.value}°`;
+  if (controls.safeDistanceValue && controls.safeDistance) controls.safeDistanceValue.textContent = `${controls.safeDistance.value} cm`;
+  if (controls.dangerDistanceValue && controls.dangerDistance) controls.dangerDistanceValue.textContent = `${controls.dangerDistance.value} cm`;
+  renderRangeHud();
 }
 
 function bindDriveButtons() {
@@ -189,19 +278,15 @@ function bindDriveButtons() {
         event.preventDefault();
         activeHoldButton = button;
         button.classList.add('active');
-        try { await sendCommand(command); } catch (err) { console.error(err); }
+        try { await sendCommand(command); } catch (err) { renderError(err.message); }
       };
       const stop = async (event) => {
         if (activeHoldButton !== button) return;
         if (event) event.preventDefault();
         activeHoldButton = null;
         button.classList.remove('active');
-        if (command === 'steer_left' || command === 'steer_right') {
-          // Sticky steering: left/right buttons set wheel angle and keep it
-          // until Center wheels / Reset pose / STOP is pressed.
-          return;
-        }
-        try { await sendCommand('stop'); } catch (err) { console.error(err); }
+        if (command === 'steer_left' || command === 'steer_right') return;
+        try { await sendCommand('stop'); } catch (err) { renderError(err.message); }
       };
       button.addEventListener('pointerdown', start);
       button.addEventListener('pointerup', stop);
@@ -211,15 +296,12 @@ function bindDriveButtons() {
     }
 
     button.addEventListener('click', async () => {
-      try { await sendCommand(command); } catch (err) { console.error(err); }
+      try { await sendCommand(command); } catch (err) { renderError(err.message); }
     });
   });
 }
 
 function bindKeyboard() {
-  // Use event.code for W/A/S/D so physical keys work even when the
-  // current keyboard layout is not English. event.key remains useful
-  // for arrows and Space.
   function commandFromKey(event) {
     if (event.code === 'KeyW' || event.key === 'ArrowUp') return 'forward';
     if (event.code === 'KeyS' || event.key === 'ArrowDown') return 'reverse';
@@ -233,14 +315,14 @@ function bindKeyboard() {
     if (event.code === 'Space' || event.key === ' ') {
       event.preventDefault();
       lastKeyboardCommand = null;
-      try { await emergencyStop(); } catch (err) { console.error(err); }
+      try { await emergencyStop(); } catch (err) { renderError(err.message); }
       return;
     }
     const command = commandFromKey(event);
     if (!command || lastKeyboardCommand === command) return;
     event.preventDefault();
     lastKeyboardCommand = command;
-    try { await sendCommand(command); } catch (err) { console.error(err); }
+    try { await sendCommand(command); } catch (err) { renderError(err.message); }
   });
 
   window.addEventListener('keyup', async (event) => {
@@ -248,62 +330,62 @@ function bindKeyboard() {
     if (!command || lastKeyboardCommand !== command) return;
     event.preventDefault();
     lastKeyboardCommand = null;
-
-    if (command === 'steer_left' || command === 'steer_right') {
-      // Sticky steering: releasing A/D or ←/→ does not center the wheels.
-      // Use Center wheels, Reset pose, STOP, or Brake to return to neutral.
-      return;
-    }
-
-    try { await sendCommand('stop'); } catch (err) { console.error(err); }
+    if (command === 'steer_left' || command === 'steer_right') return;
+    try { await sendCommand('stop'); } catch (err) { renderError(err.message); }
   });
 }
 
 function bindLidarButtons() {
   document.querySelectorAll('[data-lidar]').forEach((button) => {
     button.addEventListener('click', async () => {
-      try { await sendLidar(button.dataset.lidar); } catch (err) { console.error(err); }
+      try { await sendLidar(button.dataset.lidar); } catch (err) { renderError(err.message); }
     });
   });
   document.querySelectorAll('[data-lidar-to]').forEach((button) => {
     button.addEventListener('click', async () => {
-      try { await sendLidar('to', { angle_deg: Number(button.dataset.lidarTo) }); } catch (err) { console.error(err); }
+      try { await sendLidar('to', { angle_deg: Number(button.dataset.lidarTo) }); } catch (err) { renderError(err.message); }
     });
   });
-  document.getElementById('lidarScanBtn').addEventListener('click', async () => {
-    try { await sendLidar('scan'); } catch (err) { console.error(err); }
+  document.getElementById('lidarScanBtn')?.addEventListener('click', async () => {
+    try { await sendLidar('scan'); } catch (err) { renderError(err.message); }
   });
-  document.getElementById('lidarSweepBtn').addEventListener('click', async () => {
-    try { await sendLidar('sweep'); } catch (err) { console.error(err); }
+  document.getElementById('lidarSweepBtn')?.addEventListener('click', async () => {
+    try {
+      await sendLidar('sweep', { angles: RANGE_SLOTS.map(({ angle }) => angle) });
+    } catch (err) {
+      renderError(err.message);
+    }
   });
 }
 
 function bindTopActions() {
-  document.getElementById('stopBtn').addEventListener('click', async () => {
-    try { await emergencyStop(); } catch (err) { console.error(err); }
+  const bindClick = (id, handler) => document.getElementById(id)?.addEventListener('click', handler);
+
+  bindClick('stopBtn', async () => {
+    try { await emergencyStop(); } catch (err) { renderError(err.message); }
   });
-  document.getElementById('startAvoidBtn').addEventListener('click', async () => {
-    try { await startAvoidObstacle(); } catch (err) { console.error(err); }
+  bindClick('startAvoidBtn', async () => {
+    try { await startAvoidObstacle(); } catch (err) { renderError(err.message); }
   });
-  document.getElementById('stopMissionBtn').addEventListener('click', async () => {
-    try { await stopMission(); } catch (err) { console.error(err); }
+  bindClick('stopMissionBtn', async () => {
+    try { await stopMission(); } catch (err) { renderError(err.message); }
   });
-  document.getElementById('manualModeBtn').addEventListener('click', async () => {
+  bindClick('manualModeBtn', async () => {
     try {
       await stopMission();
       await sendCommand('stop');
-    } catch (err) { console.error(err); }
+    } catch (err) { renderError(err.message); }
   });
-  document.getElementById('shutdownBtn').addEventListener('click', async () => {
+  bindClick('shutdownBtn', async () => {
     const ok = window.confirm('Shutdown Marsy dashboard server? Motors will brake first.');
     if (!ok) return;
     shuttingDown = true;
     try {
       const data = await postJSON('/api/shutdown');
       updateState(data);
-      stateEls.logs.textContent += '\nDashboard shutdown requested. Terminal process should exit.';
+      if (stateEls.logs) stateEls.logs.textContent += '\nDashboard shutdown requested. Map files will be removed before exit.';
     } catch (err) {
-      console.error(err);
+      renderError(err.message);
     }
   });
 }
@@ -315,7 +397,7 @@ function startPolling() {
       const data = await getJSON('/api/state');
       updateState(data);
     } catch (err) {
-      setText(stateEls.lastError, err.message);
+      renderError(err.message);
     }
   }, 700);
 
@@ -325,24 +407,29 @@ function startPolling() {
       const data = await postJSON('/api/heartbeat');
       updateState(data);
     } catch (err) {
-      setText(stateEls.lastError, err.message);
+      renderError(err.message);
     }
   }, 500);
 }
 
 window.addEventListener('beforeunload', () => {
   if (navigator.sendBeacon) {
-    navigator.sendBeacon('/api/command', new Blob([JSON.stringify(commandPayload('stop'))], { type: 'application/json' }));
+    navigator.sendBeacon('/api/command', new Blob(
+      [JSON.stringify(commandPayload('stop'))],
+      { type: 'application/json' },
+    ));
   }
 });
 
 Object.values(controls).forEach((control) => {
-  if (control && control.addEventListener) {
+  if (control?.addEventListener && control.type !== 'hidden') {
     control.addEventListener('input', updateSliderLabels);
   }
 });
 
 updateSliderLabels();
+renderError(null);
+renderRangeHud();
 bindDriveButtons();
 bindKeyboard();
 bindLidarButtons();
@@ -351,6 +438,4 @@ startPolling();
 
 getJSON('/api/state')
   .then(updateState)
-  .catch((err) => { setText(stateEls.lastError, err.message); });
-
-refreshLidarReadout();
+  .catch((err) => { renderError(err.message); });

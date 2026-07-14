@@ -21,6 +21,7 @@ Override with:
 from __future__ import annotations
 
 import os
+import time
 
 
 # Servo channels used by the original 4tronix library.
@@ -89,6 +90,14 @@ class MarsyMotion:
         self.mast_center_offset_deg = _env_float("MARSY_MAST_CENTER_OFFSET_DEG", 0.0)
         self.mast_min_deg = _env_float("MARSY_MAST_MIN_DEG", -90.0)
         self.mast_max_deg = _env_float("MARSY_MAST_MAX_DEG", 90.0)
+
+        # Rotation steering pose. Before a differential spin, the four
+        # steerable corner wheels are placed in an X pattern so their rolling
+        # directions are approximately tangent to a circle around the rover
+        # centre. This reduces lateral scrubbing compared with spinning while
+        # all wheels point straight ahead.
+        self.rotate_steer_angle_deg = _env_float("MARSY_ROTATE_STEER_ANGLE_DEG", 42.0)
+        self.steering_settle_s = max(0.0, _env_float("MARSY_STEERING_SETTLE_S", 0.22))
 
     # ------------------------------------------------------------------
     # Generic helpers
@@ -164,6 +173,28 @@ class MarsyMotion:
         angle = clamp_angle(angle)
         self.set_wheel_servos(fl=angle, fr=angle, rl=-angle, rr=-angle)
 
+    def wheels_for_rotation(self, angle: int | float | None = None) -> None:
+        """Place the corner wheels in an X pose for an in-place rotation.
+
+        The middle wheel pair cannot steer, so a real Marsy rotation still
+        contains some skid. The X pose substantially reduces tyre scrubbing
+        and servo load compared with spinning with all four steering wheels
+        straight.
+        """
+        requested = self.rotate_steer_angle_deg if angle is None else float(angle)
+        rotation_angle = abs(clamp_angle(requested))
+        self.set_wheel_servos(
+            fl=rotation_angle,
+            fr=-rotation_angle,
+            rl=-rotation_angle,
+            rr=rotation_angle,
+        )
+
+    def _prepare_rotation(self, steering_angle: int | float | None = None) -> None:
+        self.wheels_for_rotation(steering_angle)
+        if self.steering_settle_s > 0:
+            time.sleep(self.steering_settle_s)
+
     # ------------------------------------------------------------------
     # Drive motors
     # ------------------------------------------------------------------
@@ -186,10 +217,12 @@ class MarsyMotion:
     def brake(self) -> None:
         self.rover.brake()
 
-    def spin_left(self, speed: int = 50) -> None:
+    def spin_left(self, speed: int = 50, steering_angle: int | float | None = None) -> None:
+        self._prepare_rotation(steering_angle)
         self.rover.spinLeft(clamp_speed(speed))
 
-    def spin_right(self, speed: int = 50) -> None:
+    def spin_right(self, speed: int = 50, steering_angle: int | float | None = None) -> None:
+        self._prepare_rotation(steering_angle)
         self.rover.spinRight(clamp_speed(speed))
 
     def turn_forward(self, left_speed: int, right_speed: int) -> None:

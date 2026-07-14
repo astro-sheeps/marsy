@@ -13,6 +13,7 @@ when it is installed, otherwise the UI still loads with a placeholder stream.
 from __future__ import annotations
 
 import argparse
+import atexit
 import json
 import os
 import signal
@@ -25,11 +26,19 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Dict, Optional
-from urllib.parse import urlparse
+from urllib.parse import quote, unquote, urlparse
 
 from marsy_web.camera import CameraStream
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+MAPS_DIR = Path(
+    os.getenv("MARSY_MAP_DIR", str(PROJECT_ROOT / "artifacts" / "maps"))
+).expanduser().resolve()
+MAP_LIST_LIMIT = max(1, int(os.getenv("MARSY_MAP_LIST_LIMIT", "250")))
+MAP_MAX_BYTES = max(1024, int(os.getenv("MARSY_MAP_MAX_BYTES", str(10 * 1024 * 1024))))
+LATEST_MAP_STEM = "explore_area_latest"
+MAP_OUTPUT_SUFFIXES = {".json", ".svg", ".tmp"}
 DEFAULT_MODE = os.getenv("MARSY_MODE", "real").strip().lower()
 HEARTBEAT_TIMEOUT_S = float(os.getenv("MARSY_WEB_HEARTBEAT_TIMEOUT", "1.5"))
 DISTANCE_POLL_INTERVAL_S = float(os.getenv("MARSY_WEB_DISTANCE_POLL_INTERVAL", "0.75"))
@@ -43,6 +52,171 @@ NO_ECHO_MEANS_CLEAR = os.getenv("MARSY_WEB_NO_ECHO_BLOCKS", "0").strip().lower()
 FORWARD_COMMANDS = {"forward", "forward_left", "forward_right"}
 STEERING_COMMANDS = {"steer_left", "steer_right"}
 MOVING_COMMANDS = FORWARD_COMMANDS | {"reverse", "reverse_left", "reverse_right", "spin_left", "spin_right"}
+
+MISSION_CATALOG: list[dict[str, Any]] = [
+    {
+        "id": "avoid_obstacle",
+        "name": "Obstacle avoidance",
+        "description": "Drive continuously, scan with the mast sensor, and steer around nearby obstacles.",
+        "map_enabled": False,
+        "parameters": [
+            {"name": "run_seconds", "label": "Run seconds", "type": "number", "min": 1, "step": 1, "optional": True},
+            {"name": "forward_speed", "label": "Forward speed", "type": "number", "min": 10, "max": 70, "step": 1, "default": 25},
+            {"name": "safe_distance", "label": "Safe distance, cm", "type": "number", "min": 20, "max": 120, "step": 1, "default": 55},
+            {"name": "danger_distance", "label": "Danger distance, cm", "type": "number", "min": 10, "max": 90, "step": 1, "default": 35},
+        ],
+    },
+    {
+        "id": "explore_area",
+        "name": "Explore area",
+        "description": "Explore unknown space, avoid obstacles, and continuously save a SLAM-lite occupancy map.",
+        "map_enabled": True,
+        "parameters": [
+            {"name": "steps", "label": "Maximum steps", "type": "number", "min": 1, "max": 500, "step": 1, "default": 20},
+            {"name": "run_seconds", "label": "Run seconds", "type": "number", "min": 1, "step": 1, "optional": True},
+            {"name": "step_distance", "label": "Step distance, cm", "type": "number", "min": 2, "max": 50, "step": 1, "default": 12},
+            {"name": "speed", "label": "Forward speed", "type": "number", "min": 10, "max": 60, "step": 1, "default": 25},
+            {"name": "safe_distance", "label": "Safe distance, cm", "type": "number", "min": 20, "max": 120, "step": 1, "default": 45},
+            {"name": "danger_distance", "label": "Danger distance, cm", "type": "number", "min": 10, "max": 90, "step": 1, "default": 28},
+            {"name": "resolution", "label": "Map cell, cm", "type": "number", "min": 2, "max": 20, "step": 1, "default": 5},
+            {"name": "return_home", "label": "Return home after exploration", "type": "checkbox", "default": False},
+        ],
+    },
+]
+
+
+
+def _clear_map_artifacts() -> int:
+    """Delete dashboard map exports and temporary files.
+
+    Maps are session data: the dashboard keeps only the current JSON/SVG pair
+    while it is running and removes it during normal shutdown. Clearing at
+    startup also removes leftovers after an unclean power loss.
+    """
+    MAPS_DIR.mkdir(parents=True, exist_ok=True)
+    removed = 0
+    for path in MAPS_DIR.iterdir():
+        if not path.is_file():
+            continue
+        if path.suffix.lower() not in MAP_OUTPUT_SUFFIXES and not path.name.endswith(".tmp"):
+            continue
+        try:
+            path.unlink(missing_ok=True)
+            removed += 1
+        except OSError:
+            continue
+    return removed
+
+def _safe_map_path(filename: str, allowed_suffixes: set[str]) -> Optional[Path]:
+    """Resolve a map filename without allowing directory traversal."""
+    decoded = unquote(filename).strip()
+    if not decoded or Path(decoded).name != decoded:
+        return None
+    candidate = (MAPS_DIR / decoded).resolve()
+    if candidate.parent != MAPS_DIR or candidate.suffix.lower() not in allowed_suffixes:
+        return None
+    return candidate
+
+
+def _map_run_id(stem: str) -> str:
+    if stem.endswith("_final"):
+        return stem[:-6]
+    marker = stem.rfind("_step_")
+    if marker >= 0:
+        return stem[:marker]
+    return stem
+
+
+def _map_summary(path: Path) -> Dict[str, Any]:
+    stat = path.stat()
+    summary: Dict[str, Any] = {
+        "name": path.name,
+        "run_id": _map_run_id(path.stem),
+        "modified_at": stat.st_mtime,
+        "size_bytes": stat.st_size,
+        "is_final": path.stem.endswith("_final"),
+        "json_url": f"/maps/file/{quote(path.name)}",
+        "svg_url": None,
+        "format": None,
+        "mapping_mode": None,
+        "resolution_cm": None,
+        "path_points": 0,
+        "cells": 0,
+        "free_cells": 0,
+        "occupied_cells": 0,
+        "visited_cells": 0,
+        "metadata": {},
+        "error": None,
+    }
+
+    svg_path = path.with_suffix(".svg")
+    if svg_path.exists() and svg_path.is_file():
+        summary["svg_url"] = f"/maps/file/{quote(svg_path.name)}"
+
+    if stat.st_size > MAP_MAX_BYTES:
+        summary["error"] = f"map file is larger than {MAP_MAX_BYTES} bytes"
+        return summary
+
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            raise ValueError("map root must be an object")
+        cells = data.get("cells") if isinstance(data.get("cells"), list) else []
+        path_points = data.get("path") if isinstance(data.get("path"), list) else []
+        states = [cell.get("state") for cell in cells if isinstance(cell, dict)]
+        metadata = data.get("metadata") if isinstance(data.get("metadata"), dict) else {}
+        summary.update(
+            {
+                "format": data.get("format"),
+                "mapping_mode": data.get("mapping_mode"),
+                "resolution_cm": data.get("resolution_cm"),
+                "path_points": len(path_points),
+                "cells": len(cells),
+                "free_cells": sum(1 for state in states if state == "free"),
+                "occupied_cells": sum(1 for state in states if state == "occupied"),
+                "visited_cells": sum(
+                    1
+                    for cell in cells
+                    if isinstance(cell, dict) and int(cell.get("visits", 0) or 0) > 0
+                ),
+                "metadata": metadata,
+                "is_final": bool(metadata.get("final", summary["is_final"])),
+            }
+        )
+    except Exception as exc:
+        summary["error"] = f"{type(exc).__name__}: {exc}"
+    return summary
+
+
+def _list_maps() -> Dict[str, Any]:
+    MAPS_DIR.mkdir(parents=True, exist_ok=True)
+    paths = sorted(
+        (path for path in MAPS_DIR.glob("*.json") if path.is_file()),
+        key=lambda path: path.stat().st_mtime,
+        reverse=True,
+    )[:MAP_LIST_LIMIT]
+    return {
+        "maps": [_map_summary(path) for path in paths],
+        "count": len(paths),
+        "limit": MAP_LIST_LIMIT,
+    }
+
+
+def _read_map(filename: str) -> tuple[Optional[Dict[str, Any]], Optional[str]]:
+    path = _safe_map_path(filename, {".json"})
+    if path is None:
+        return None, "invalid map filename"
+    if not path.exists() or not path.is_file():
+        return None, "map not found"
+    if path.stat().st_size > MAP_MAX_BYTES:
+        return None, f"map file is larger than {MAP_MAX_BYTES} bytes"
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        return None, f"cannot read map: {type(exc).__name__}: {exc}"
+    if not isinstance(data, dict):
+        return None, "map root must be an object"
+    return data, None
 
 
 class MissionStopRequested(Exception):
@@ -58,6 +232,7 @@ class MissionState:
     returncode: Optional[int] = None
     last_error: Optional[str] = None
     command: list[str] = field(default_factory=list)
+    progress: Dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -98,6 +273,24 @@ def _fmt_distance(value: Optional[float]) -> str:
         return f"{float(value):.1f} cm"
     except (TypeError, ValueError):
         return str(value)
+
+
+def _clamp_float(value: Any, low: float, high: float, default: float) -> float:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        parsed = default
+    return max(low, min(high, parsed))
+
+
+def _optional_positive_float(value: Any) -> Optional[float]:
+    if value in (None, ""):
+        return None
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed > 0 else None
 
 
 class RoverController:
@@ -195,6 +388,9 @@ class RoverController:
         except Exception as exc:
             self.log(f"rover cleanup failed: {exc}")
 
+        removed_maps = _clear_map_artifacts()
+        if removed_maps:
+            self.log(f"Removed {removed_maps} dashboard map files")
         self.log("Dashboard cleanup complete")
 
     def request_shutdown_state(self, reason: str) -> Dict[str, Any]:
@@ -704,62 +900,17 @@ class RoverController:
         self.stop_mission(reason="dashboard stop")
         return self.command({"command": "brake"})
 
-    def start_mission(self, payload: Dict[str, Any]) -> Dict[str, Any]:
-        """Start dashboard-owned obstacle avoidance using the shared rover object.
+    def list_missions(self) -> Dict[str, Any]:
+        with self._lock:
+            active = asdict(self.state.mission)
+        return {"missions": MISSION_CATALOG, "active": active}
 
-        We do not spawn `python -m missions.avoid_obstacle` here anymore. The
-        subprocess version was fine for the simulator, but on the real rover it
-        can fight this dashboard for GPIO/PWM ownership. That is what leads to
-        errors such as "PWM object already exists for this GPIO channel" after
-        a mission is stopped and the dashboard tries to use the mast again.
-        """
-        mission = str(payload.get("mission", "avoid_obstacle")).strip().lower()
-        if mission != "avoid_obstacle":
-            with self._lock:
-                self.state.last_error = f"unknown mission: {mission}"
-            return self.get_state()
-
+    def _begin_mission(self, mission: str, safe_distance: float, danger_distance: float) -> bool:
         with self._lock:
             if self.state.mission.running:
                 self.state.last_error = "mission is already running"
-                return self.get_state()
-
-        try:
-            safe_distance = float(payload.get("safe_distance", DEFAULT_SAFE_DISTANCE_CM))
-        except (TypeError, ValueError):
-            safe_distance = DEFAULT_SAFE_DISTANCE_CM
-        try:
-            danger_distance = float(payload.get("danger_distance", DEFAULT_DANGER_DISTANCE_CM))
-        except (TypeError, ValueError):
-            danger_distance = DEFAULT_DANGER_DISTANCE_CM
-        run_seconds_raw = payload.get("run_seconds")
-        run_seconds: Optional[float]
-        if run_seconds_raw in (None, ""):
-            run_seconds = None
-        else:
-            try:
-                run_seconds = float(run_seconds_raw)
-            except (TypeError, ValueError):
-                run_seconds = None
-
-        cfg = {
-            "safe_distance": safe_distance,
-            "danger_distance": danger_distance,
-            "forward_speed": _clamp_int(payload.get("forward_speed", 25), 0, 100, 25),
-            "turn_speed": _clamp_int(payload.get("turn_speed", 25), 0, 100, 25),
-            "reverse_speed": _clamp_int(payload.get("reverse_speed", 20), 0, 100, 20),
-            "scan_angle": _clamp_int(payload.get("scan_angle", 55), 0, MAST_MAX_ANGLE_DEG, 55),
-            "steer_angle": _clamp_int(payload.get("steer_angle", 28), 0, 60, 28),
-            "reverse_time": float(payload.get("reverse_time", 0.55) or 0.55),
-            "turn_time": float(payload.get("turn_time", 1.05) or 1.05),
-            "scan_settle": float(payload.get("scan_settle", LIDAR_SETTLE_S) or LIDAR_SETTLE_S),
-            "loop_delay": 0.15,
-            "default_turn": "right",
-            "run_seconds": run_seconds,
-        }
-
-        self._mission_stop_event.clear()
-        with self._lock:
+                return False
+            self._mission_stop_event.clear()
             self._manual_active_command = None
             self.state.mode = "mission"
             self.state.safe_distance_cm = safe_distance
@@ -769,9 +920,60 @@ class RoverController:
                 name=mission,
                 started_at=time.time(),
                 command=["dashboard-thread", mission],
+                progress={},
             )
             self.state.last_command = f"start mission: {mission}"
             self.state.last_error = None
+        return True
+
+    def _finish_mission(self, mission: str, returncode: int) -> None:
+        with self._lock:
+            self.state.mode = "manual"
+            self.state.mission.running = False
+            self.state.mission.returncode = returncode
+            self.state.last_command = f"mission finished: {mission} ({returncode})"
+
+    def start_mission(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """Start a dashboard-owned mission using the dashboard's rover instance.
+
+        Missions stay in this process so the dashboard and a child process do
+        not compete for GPIO, PWM, the mast servo, or the ultrasonic sensor.
+        """
+        mission = str(payload.get("mission", "avoid_obstacle")).strip().lower()
+        known = {item["id"] for item in MISSION_CATALOG}
+        if mission not in known:
+            with self._lock:
+                self.state.last_error = f"unknown mission: {mission}"
+            return self.snapshot_state()
+        if mission == "avoid_obstacle":
+            return self._start_avoid_obstacle(payload)
+        if mission == "explore_area":
+            return self._start_explore_area(payload)
+        with self._lock:
+            self.state.last_error = f"mission is not dashboard-compatible: {mission}"
+        return self.snapshot_state()
+
+    def _start_avoid_obstacle(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        safe_distance = _clamp_float(payload.get("safe_distance"), 10.0, 200.0, DEFAULT_SAFE_DISTANCE_CM)
+        danger_distance = _clamp_float(payload.get("danger_distance"), 5.0, safe_distance, DEFAULT_DANGER_DISTANCE_CM)
+        run_seconds = _optional_positive_float(payload.get("run_seconds"))
+        cfg = {
+            "safe_distance": safe_distance,
+            "danger_distance": danger_distance,
+            "forward_speed": _clamp_int(payload.get("forward_speed", 25), 0, 100, 25),
+            "turn_speed": _clamp_int(payload.get("turn_speed", payload.get("forward_speed", 25)), 0, 100, 25),
+            "reverse_speed": _clamp_int(payload.get("reverse_speed", 20), 0, 100, 20),
+            "scan_angle": _clamp_int(payload.get("scan_angle", 55), 0, MAST_MAX_ANGLE_DEG, 55),
+            "steer_angle": _clamp_int(payload.get("steer_angle", 28), 0, 60, 28),
+            "reverse_time": _clamp_float(payload.get("reverse_time", 0.55), 0.1, 5.0, 0.55),
+            "turn_time": _clamp_float(payload.get("turn_time", 1.05), 0.1, 8.0, 1.05),
+            "scan_settle": _clamp_float(payload.get("scan_settle", LIDAR_SETTLE_S), 0.05, 2.0, LIDAR_SETTLE_S),
+            "loop_delay": 0.15,
+            "default_turn": "right",
+            "run_seconds": run_seconds,
+        }
+        if not self._begin_mission("avoid_obstacle", safe_distance, danger_distance):
+            return self.snapshot_state()
 
         def _run() -> None:
             start_time = time.time()
@@ -793,6 +995,11 @@ class RoverController:
                         break
                     with self._hardware_lock:
                         self._mission_step_locked(cfg)
+                    with self._lock:
+                        self.state.mission.progress = {
+                            "elapsed_s": round(time.time() - start_time, 1),
+                            "run_seconds": run_seconds,
+                        }
                     time.sleep(float(cfg["loop_delay"]))
             except MissionStopRequested:
                 self.log("Dashboard obstacle avoidance stopped")
@@ -808,15 +1015,328 @@ class RoverController:
                             self._motion.brake_and_reset()
                 except Exception as exc:
                     self.log(f"mission shutdown brake warning: {exc}")
-                with self._lock:
-                    self.state.mode = "manual"
-                    self.state.mission.running = False
-                    self.state.mission.returncode = returncode
-                    if self.state.last_command.startswith("start mission") or self.state.mode == "mission":
-                        self.state.last_command = f"mission finished: {returncode}"
+                self._finish_mission("avoid_obstacle", returncode)
                 self.log(f"Dashboard obstacle avoidance finished with code {returncode}")
 
         thread = threading.Thread(target=_run, name="marsy-obstacle-avoidance", daemon=True)
+        self._mission_thread = thread
+        thread.start()
+        return self.snapshot_state()
+
+    def _start_explore_area(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        steps = _clamp_int(payload.get("steps", 20), 1, 500, 20)
+        run_seconds = _optional_positive_float(payload.get("run_seconds"))
+        step_distance = _clamp_float(payload.get("step_distance", 12.0), 2.0, 50.0, 12.0)
+        speed = _clamp_int(payload.get("speed", 25), 10, 60, 25)
+        rotate_speed = _clamp_int(payload.get("rotate_speed", speed), 10, 60, speed)
+        safe_distance = _clamp_float(payload.get("safe_distance", 45.0), 20.0, 150.0, 45.0)
+        danger_distance = _clamp_float(payload.get("danger_distance", 28.0), 10.0, safe_distance, 28.0)
+        max_range = _clamp_float(payload.get("max_range", 200.0), 50.0, 400.0, 200.0)
+        resolution = _clamp_float(payload.get("resolution", 5.0), 2.0, 20.0, 5.0)
+        return_home = bool(payload.get("return_home", False))
+        # Scan from the centre outwards, alternating sides. This makes the
+        # camera HUD update symmetrically and ensures right-side samples are
+        # published early even if a scan is interrupted.
+        scan_angles = [0.0, -25.0, 25.0, -50.0, 50.0, -75.0, 75.0]
+        if not self._begin_mission("explore_area", safe_distance, danger_distance):
+            return self.snapshot_state()
+
+        def _save(skills: Any, step: int, final: bool = False) -> tuple[Path, Path]:
+            # The map viewer needs one coherent, continually updated map rather
+            # than hundreds of step snapshots. Atomic exporters in
+            # skills.mapping keep readers from seeing a half-written file.
+            json_path = MAPS_DIR / f"{LATEST_MAP_STEM}.json"
+            svg_path = MAPS_DIR / f"{LATEST_MAP_STEM}.svg"
+            metadata = {
+                "mission": "explore_area",
+                "step": step,
+                "final": final,
+                "pose_source": skills.pose.source,
+                "note": "SLAM-lite occupancy grid; no loop closure",
+            }
+            skills.map.save_json(json_path, current_pose=skills.pose, metadata=metadata)
+            skills.map.save_svg(svg_path, current_pose=skills.pose)
+            return json_path, svg_path
+
+        def _choose(skills: Any, samples: list[Any]) -> Optional[tuple[float, float, float]]:
+            candidates: list[tuple[float, float, float]] = []
+            for sample in samples:
+                if str(getattr(sample, "quality", "unknown")) != "measured":
+                    continue
+                angle = float(sample.mast_angle_deg)
+                distance = sample.distance_cm
+                if distance is None:
+                    continue
+                clearance = float(distance)
+                if clearance < safe_distance:
+                    continue
+                score = skills.map.direction_score(skills.pose, angle, clearance)
+                candidates.append((score, angle, clearance))
+            return max(candidates, key=lambda item: item[0]) if candidates else None
+
+        def _publish_sweep(samples: list[Any], *, scanning: bool, scan_id: str) -> None:
+            """Expose the same range samples used by mapping to the camera HUD.
+
+            Every sample is marked as measured even when the ultrasonic sensor
+            returns no echo. The browser can therefore distinguish "not
+            measured yet" from "measured and clear beyond sensor range".
+            """
+            serialised: list[Dict[str, Any]] = []
+            center_distance: Optional[float] = None
+            for sample in samples:
+                try:
+                    angle = float(sample.mast_angle_deg)
+                    raw_distance = sample.distance_cm
+                    distance = None if raw_distance is None else round(float(raw_distance), 1)
+                    no_echo = bool(getattr(sample, "no_echo", raw_distance is None))
+                    quality = str(getattr(sample, "quality", "measured" if distance is not None else "unknown"))
+                    spread_cm = getattr(sample, "spread_cm", None)
+                except (AttributeError, TypeError, ValueError):
+                    continue
+                serialised.append(
+                    {
+                        "angle_deg": angle,
+                        "distance_cm": distance,
+                        "measured": True,
+                        "no_echo": no_echo,
+                        "quality": quality,
+                        "spread_cm": spread_cm,
+                    }
+                )
+                if abs(angle) < 0.5 and distance is not None:
+                    center_distance = distance
+
+            with self._lock:
+                self.state.lidar_scan = {
+                    "kind": "sweep",
+                    "source": "explore_area",
+                    "scan_id": scan_id,
+                    "scanning": scanning,
+                    "max_range_cm": max_range,
+                    "samples": serialised,
+                    "updated_at": time.time(),
+                }
+                if center_distance is not None:
+                    self.state.distance_cm = center_distance
+
+        def _publish_avoidance_scan(scan: Any) -> None:
+            if not isinstance(scan, dict):
+                return
+            distances = {
+                "left": scan.get("left"),
+                "center": scan.get("center"),
+                "right": scan.get("right"),
+            }
+            with self._lock:
+                self.state.lidar_scan = {
+                    "kind": "triad",
+                    "source": "explore_area_avoidance",
+                    "scanning": False,
+                    "distances": distances,
+                    "updated_at": time.time(),
+                }
+                center = distances.get("center")
+                if center is not None:
+                    try:
+                        self.state.distance_cm = round(float(center), 1)
+                    except (TypeError, ValueError):
+                        pass
+
+        def _scan_with_retry(skills: Any, *, scan_id: str) -> tuple[list[Any], Dict[str, Any]]:
+            result = skills.scan_arc(
+                angles=scan_angles,
+                samples=3,
+                on_sample=lambda _sample, collected: _publish_sweep(
+                    collected, scanning=True, scan_id=scan_id
+                ),
+            )
+            samples = list(result.data.get("samples", []))
+            _publish_sweep(samples, scanning=False, scan_id=scan_id)
+            corridor = skills.assess_forward_corridor(samples)
+            if corridor.get("status") == "range_unknown" and not self._mission_stop_event.is_set():
+                retry_id = f"{scan_id}-retry"
+                shifted = [max(-90.0, min(90.0, angle + 4.0)) for angle in scan_angles]
+                self.log("Unreliable sonar sectors; repeating full scan with +4° mast offset")
+                result = skills.scan_arc(
+                    angles=shifted,
+                    samples=3,
+                    on_sample=lambda _sample, collected: _publish_sweep(
+                        collected, scanning=True, scan_id=retry_id
+                    ),
+                )
+                samples = list(result.data.get("samples", []))
+                _publish_sweep(samples, scanning=False, scan_id=retry_id)
+                corridor = skills.assess_forward_corridor(samples)
+            return samples, corridor
+
+        def _recovery_angle(samples: list[Any], step: int) -> float:
+            trusted: list[tuple[float, float]] = []
+            for sample in samples:
+                if str(getattr(sample, "quality", "unknown")) != "measured":
+                    continue
+                distance = getattr(sample, "distance_cm", None)
+                angle = float(getattr(sample, "mast_angle_deg", 0.0))
+                if distance is None or abs(angle) < 8.0:
+                    continue
+                trusted.append((float(distance), angle))
+            if trusted:
+                return max(-55.0, min(55.0, max(trusted, key=lambda item: item[0])[1]))
+            return 35.0 if step % 2 == 0 else -35.0
+
+        def _recover(skills: Any, samples: list[Any], corridor: Dict[str, Any], step: int) -> bool:
+            skills.stop(brake=True, reset_pose=False)
+            minimum = corridor.get("minimum_distance_cm")
+            if minimum is not None and float(minimum) < danger_distance:
+                skills.move_backward(distance_cm=5.0, speed=20)
+            angle = _recovery_angle(samples, step)
+            self.log(
+                f"Unsafe/unknown corridor ({corridor.get('status')}): "
+                f"rotate {angle:+.0f}° without forward motion"
+            )
+            return bool(skills.rotate(angle, speed=rotate_speed).ok)
+
+        def _run() -> None:
+            returncode = 0
+            completed_steps = 0
+            skills = None
+            started = time.time()
+            try:
+                from skills import MarsySkills, SkillsConfig, SparseOccupancyGrid
+
+                MAPS_DIR.mkdir(parents=True, exist_ok=True)
+                removed_maps = _clear_map_artifacts()
+                if removed_maps:
+                    self.log(f"Removed {removed_maps} stale map files before exploration")
+                with self._hardware_lock:
+                    self._ensure_initialized()
+                    assert self._rover is not None
+                    assert self._motion is not None
+                    assert self._sensors is not None
+                    self._motion.stop_and_reset()
+                    config = SkillsConfig(
+                        safe_distance_cm=safe_distance,
+                        danger_distance_cm=danger_distance,
+                        max_range_cm=max_range,
+                        default_speed=speed,
+                        default_turn_speed=rotate_speed,
+                    )
+                    occupancy_map = SparseOccupancyGrid(
+                        resolution_cm=resolution,
+                        max_range_cm=max_range,
+                    )
+                    skills = MarsySkills(
+                        self._rover,
+                        motion=self._motion,
+                        sensors=self._sensors,
+                        occupancy_map=occupancy_map,
+                        config=config,
+                        stop_requested=lambda: self._mission_stop_event.is_set() or self._stop_threads.is_set(),
+                    )
+                    skills.sync_pose()
+                    skills.home_pose = skills.pose.normalized()
+                    skills.set_led_status("exploring")
+
+                self.log(
+                    "Dashboard explore area started: "
+                    f"steps={steps}, step={step_distance} cm, safe={safe_distance} cm"
+                )
+                for step in range(steps):
+                    if self._mission_stop_event.is_set() or self._stop_threads.is_set():
+                        break
+                    if run_seconds is not None and time.time() - started >= run_seconds:
+                        self.log("Explore area run time finished")
+                        break
+                    assert skills is not None
+                    scan_id = f"explore-{int(started * 1000)}-{step + 1}"
+                    with self._hardware_lock:
+                        samples, corridor = _scan_with_retry(skills, scan_id=scan_id)
+                        choice = _choose(skills, samples)
+                        if choice is None:
+                            skills.set_led_status("obstacle")
+                            if not _recover(skills, samples, corridor, step):
+                                break
+                            skills.set_led_status("exploring")
+                        else:
+                            score, angle, clearance = choice
+                            self.log(
+                                f"Explore step {step + 1}: {angle:+.0f}°, "
+                                f"clearance={clearance:.1f} cm, score={score:.1f}"
+                            )
+                            if abs(angle) >= 8.0:
+                                rotation = skills.rotate(angle, speed=rotate_speed)
+                                if not rotation.ok:
+                                    break
+                                # The first scan is no longer aligned after a
+                                # turn, so scan all seven sectors again before
+                                # allowing any forward motion.
+                                aligned_id = f"{scan_id}-aligned"
+                                samples, corridor = _scan_with_retry(skills, scan_id=aligned_id)
+
+                            if not corridor.get("safe"):
+                                skills.set_led_status("obstacle")
+                                if not _recover(skills, samples, corridor, step):
+                                    break
+                                skills.set_led_status("exploring")
+                            else:
+                                movement = skills.move_forward(
+                                    distance_cm=step_distance,
+                                    speed=speed,
+                                    require_recent_scan=True,
+                                )
+                                if not movement.ok:
+                                    skills.set_led_status("obstacle")
+                                    if not _recover(
+                                        skills, samples, skills.assess_forward_corridor(), step
+                                    ):
+                                        break
+                                    skills.set_led_status("exploring")
+
+                    completed_steps = step + 1
+                    json_path, svg_path = _save(skills, completed_steps)
+                    with self._lock:
+                        self.state.mission.progress = {
+                            "step": completed_steps,
+                            "total_steps": steps,
+                            "elapsed_s": round(time.time() - started, 1),
+                            "latest_map": json_path.name,
+                            "latest_svg": svg_path.name,
+                        }
+                        self.state.last_command = f"explore step {completed_steps}/{steps}"
+                    self.log(f"Explore map saved: {json_path.name}")
+
+                if return_home and not self._mission_stop_event.is_set() and skills is not None:
+                    with self._hardware_lock:
+                        result = skills.return_home()
+                    self.log(f"Return home: {result.message}")
+                if skills is not None and not self._mission_stop_event.is_set():
+                    with self._hardware_lock:
+                        skills.set_led_status("success")
+            except Exception as exc:
+                returncode = 1
+                self.log(f"Dashboard explore area failed: {type(exc).__name__}: {exc}")
+                with self._lock:
+                    self.state.last_error = f"mission failed: {type(exc).__name__}: {exc}"
+            finally:
+                if skills is not None:
+                    try:
+                        final_json, final_svg = _save(skills, completed_steps, final=True)
+                        with self._lock:
+                            self.state.mission.progress.update(
+                                {"latest_map": final_json.name, "latest_svg": final_svg.name, "final": True}
+                            )
+                        self.log(f"Final explore map saved: {final_json.name}")
+                    except Exception as exc:
+                        self.log(f"final map save warning: {exc}")
+                try:
+                    with self._hardware_lock:
+                        if self._motion is not None:
+                            self._motion.brake_and_reset()
+                except Exception as exc:
+                    self.log(f"explore shutdown brake warning: {exc}")
+                self._finish_mission("explore_area", returncode)
+                self.log(f"Dashboard explore area finished with code {returncode}")
+
+        thread = threading.Thread(target=_run, name="marsy-explore-area", daemon=True)
         self._mission_thread = thread
         thread.start()
         return self.snapshot_state()
@@ -866,7 +1386,7 @@ class RoverController:
 
 
 class MarsyRequestHandler(BaseHTTPRequestHandler):
-    server_version = "MarsyWeb/0.3"
+    server_version = "MarsyWeb/0.5"
 
     def _controller(self) -> RoverController:
         return self.server.controller  # type: ignore[attr-defined]
@@ -902,10 +1422,32 @@ class MarsyRequestHandler(BaseHTTPRequestHandler):
         path = urlparse(self.path).path
         if path == "/":
             return self._serve_file(STATIC_DIR / "index.html", "text/html; charset=utf-8")
+        if path == "/maps":
+            return self._serve_file(STATIC_DIR / "maps.html", "text/html; charset=utf-8")
         if path == "/static/app.js":
             return self._serve_file(STATIC_DIR / "app.js", "application/javascript; charset=utf-8")
         if path == "/static/style.css":
             return self._serve_file(STATIC_DIR / "style.css", "text/css; charset=utf-8")
+        if path == "/static/maps.js":
+            return self._serve_file(STATIC_DIR / "maps.js", "application/javascript; charset=utf-8")
+        if path == "/static/maps.css":
+            return self._serve_file(STATIC_DIR / "maps.css", "text/css; charset=utf-8")
+        if path == "/static/missions.js":
+            return self._serve_file(STATIC_DIR / "missions.js", "application/javascript; charset=utf-8")
+        if path == "/static/missions.css":
+            return self._serve_file(STATIC_DIR / "missions.css", "text/css; charset=utf-8")
+        if path == "/api/missions":
+            return self._send_json(self._controller().list_missions())
+        if path == "/api/maps":
+            return self._send_json(_list_maps())
+        if path.startswith("/api/maps/"):
+            data, error = _read_map(path[len("/api/maps/"):])
+            if error is not None or data is None:
+                status = HTTPStatus.NOT_FOUND if error == "map not found" else HTTPStatus.BAD_REQUEST
+                return self._send_json({"error": error or "cannot read map"}, status=status)
+            return self._send_json(data)
+        if path.startswith("/maps/file/"):
+            return self._serve_map_file(path[len("/maps/file/"):])
         if path == "/api/state":
             return self._send_json(self._controller().get_state())
         if path == "/video.mjpg":
@@ -938,6 +1480,17 @@ class MarsyRequestHandler(BaseHTTPRequestHandler):
     def _serve_file(self, path: Path, content_type: str) -> None:
         if not path.exists():
             return self._send_json({"error": "missing file"}, status=HTTPStatus.NOT_FOUND)
+        self._send_bytes(path.read_bytes(), content_type)
+
+    def _serve_map_file(self, filename: str) -> None:
+        path = _safe_map_path(filename, {".json", ".svg"})
+        if path is None:
+            return self._send_json({"error": "invalid map filename"}, status=HTTPStatus.BAD_REQUEST)
+        if not path.exists() or not path.is_file():
+            return self._send_json({"error": "map file not found"}, status=HTTPStatus.NOT_FOUND)
+        if path.stat().st_size > MAP_MAX_BYTES:
+            return self._send_json({"error": "map file is too large"}, status=HTTPStatus.REQUEST_ENTITY_TOO_LARGE)
+        content_type = "application/json; charset=utf-8" if path.suffix.lower() == ".json" else "image/svg+xml; charset=utf-8"
         self._send_bytes(path.read_bytes(), content_type)
 
     def _serve_mjpeg(self) -> None:
@@ -1004,6 +1557,10 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    stale_maps = _clear_map_artifacts()
+    # atexit covers ordinary interpreter shutdown in addition to the explicit
+    # server cleanup paths below. SIGKILL/power loss is handled next startup.
+    atexit.register(_clear_map_artifacts)
     camera = CameraStream(
         width=args.camera_width,
         height=args.camera_height,
@@ -1027,12 +1584,15 @@ def main() -> None:
 
     controller.log(f"Marsy dashboard: http://{args.host}:{args.port}")
     controller.log(f"Backend mode: {DEFAULT_MODE}")
+    if stale_maps:
+        controller.log(f"Removed {stale_maps} stale map files at startup")
     controller.log(f"Camera rotation: {args.camera_rotation} deg clockwise")
     try:
         server.serve_forever(poll_interval=0.2)
     finally:
         controller.cleanup()
         server.server_close()
+        _clear_map_artifacts()
         controller.log("Server socket closed")
 
 

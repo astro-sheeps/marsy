@@ -1,0 +1,526 @@
+.right-panel {
+  min-height: 0;
+}
+
+.right-tabs {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 6px;
+  flex: 0 0 auto;
+  padding: 8px;
+  border-bottom: 1px solid var(--border);
+  background: var(--panel-2);
+}
+
+.right-tab-button {
+  min-height: 36px;
+  padding: 7px 6px;
+  border: 1px solid var(--border-soft);
+  border-radius: 8px;
+  background: var(--view);
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 800;
+  cursor: pointer;
+}
+
+.right-tab-button.active {
+  border-color: var(--accent);
+  background: #2a1b11;
+  color: var(--accent-soft);
+}
+
+.right-tab-stack {
+  position: relative;
+  flex: 1;
+  min-height: 0;
+  overflow: hidden;
+}
+
+.right-tab-panel {
+  height: 100%;
+  min-height: 0;
+  padding: 12px;
+  overflow: auto;
+}
+
+.right-tab-panel[hidden] {
+  display: none;
+}
+
+.tab-panel-header,
+.mission-section-header {
+  display: none;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.telemetry-error-row {
+  border-color: #5c3530 !important;
+}
+
+.telemetry-error-row dd {
+  white-space: pre-wrap;
+}
+
+.compact-settings {
+  margin-top: 12px;
+  padding: 10px;
+  border: 1px solid var(--border-soft);
+  border-radius: 9px;
+  background: var(--panel-2);
+}
+
+.compact-settings-title,
+.mission-subtitle {
+  color: var(--text-strong);
+  font-size: 11px;
+  font-weight: 800;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.compact-settings .slider-label {
+  margin: 9px 0 4px;
+  font-size: 11px;
+}
+
+.active-mission-summary {
+  margin: 9px 0 8px;
+  padding: 9px 10px;
+  border: 1px solid var(--border-soft);
+  border-radius: 8px;
+  background: var(--view);
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.4;
+}
+
+.active-mission-summary.running {
+  border-color: var(--accent);
+  color: var(--text-strong);
+}
+
+.mission-stop-button {
+  width: 100%;
+  margin-bottom: 10px;
+}
+
+.mission-selector {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(110px, 1fr));
+  gap: 6px;
+  margin-bottom: 10px;
+}
+
+.mission-selector-button {
+  min-height: 38px;
+  padding: 7px 8px;
+  border: 1px solid var(--border-soft);
+  border-radius: 8px;
+  background: var(--panel-2);
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 800;
+  cursor: pointer;
+}
+
+.mission-selector-button.active {
+  border-color: var(--accent);
+  background: #2a1b11;
+  color: var(--accent-soft);
+}
+
+.mission-selector-button.running::after {
+  content: " •";
+  color: var(--ok);
+}
+
+.mission-list {
+  min-height: 0;
+}
+
+.mission-card {
+  padding: 12px;
+  border: 1px solid var(--border-soft);
+  border-radius: 10px;
+  background: var(--panel-2);
+}
+
+.mission-card[hidden] {
+  display: none;
+}
+
+.mission-card.active {
+  border-color: var(--accent);
+  box-shadow: inset 0 0 0 1px rgba(232, 123, 44, 0.2);
+}
+
+.mission-card-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.mission-name {
+  color: var(--text-strong);
+  font-size: 15px;
+  font-weight: 800;
+}
+
+.mission-description {
+  margin: 6px 0 12px;
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.45;
+}
+
+.mission-map-badge {
+  flex: 0 0 auto;
+  padding: 2px 6px;
+  border: 1px solid #356d46;
+  border-radius: 999px;
+  color: #8ee0a1;
+  font-size: 9px;
+  font-weight: 800;
+  text-transform: uppercase;
+}
+
+.mission-parameters {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+  margin-top: 8px;
+}
+
+.mission-field {
+  display: grid;
+  gap: 4px;
+  color: var(--muted);
+  font-size: 10px;
+  font-weight: 700;
+}
+
+.mission-field input[type="number"] {
+  width: 100%;
+  min-width: 0;
+  margin: 0;
+  padding: 7px 8px;
+}
+
+.mission-field.checkbox-field {
+  grid-column: 1 / -1;
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 4px 0;
+  color: var(--text);
+}
+
+.mission-actions {
+  display: flex;
+  gap: 7px;
+  margin-top: 12px;
+}
+
+.mission-start-button,
+.mission-stop-button,
+.mission-map-button {
+  min-height: 36px;
+  padding: 7px 10px;
+  border: 1px solid var(--border-soft);
+  border-radius: 8px;
+  background: var(--panel-3);
+  color: var(--text-strong);
+  font-weight: 800;
+  cursor: pointer;
+}
+
+.mission-start-button {
+  flex: 1;
+  border-color: var(--accent);
+  color: var(--accent-soft);
+}
+
+.mission-start-button:disabled,
+.mission-stop-button:disabled {
+  cursor: not-allowed;
+  opacity: 0.45;
+}
+
+.logs-tab-panel {
+  display: flex;
+  flex-direction: column;
+}
+
+.logs-tab-panel .logs {
+  flex: 1;
+  min-height: 0;
+  margin-top: 0;
+}
+
+.mission-error {
+  padding: 9px;
+  border: 1px solid #65322a;
+  border-radius: 8px;
+  color: #ffe7df;
+  background: #241919;
+}
+
+@media (max-width: 1180px) {
+  .right-panel {
+    min-height: 520px;
+  }
+
+  .right-tab-stack {
+    min-height: 450px;
+  }
+}
+
+@media (max-width: 520px) {
+  .mission-parameters {
+    grid-template-columns: 1fr;
+  }
+}
+
+/* Camera range HUD ------------------------------------------------------- */
+.hud-output-hint {
+  margin-top: 9px;
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.35;
+}
+
+.error-only-card {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  margin-top: 9px;
+  padding: 12px;
+  border: 1px solid var(--border-soft);
+  border-radius: 9px;
+  background: var(--view);
+  color: var(--text-strong);
+}
+
+.error-only-dot,
+.camera-error-dot {
+  flex: 0 0 auto;
+  width: 8px;
+  height: 8px;
+  margin-top: 4px;
+  border-radius: 50%;
+  background: #4da3ff;
+  box-shadow: 0 0 10px rgba(77, 163, 255, 0.5);
+}
+
+.error-only-card.has-error {
+  border-color: #7d342c;
+  background: rgba(55, 18, 16, 0.94);
+}
+
+.error-only-card.has-error .error-only-dot,
+.camera-error-hud.has-error .camera-error-dot {
+  background: var(--danger-hot);
+  box-shadow: 0 0 12px rgba(255, 91, 77, 0.58);
+}
+
+.error-only-message {
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+  line-height: 1.45;
+}
+
+.camera-error-hud {
+  position: absolute;
+  z-index: 5;
+  top: 16px;
+  left: 16px;
+  display: none;
+  align-items: flex-start;
+  gap: 10px;
+  max-width: min(330px, calc(100% - 32px));
+  padding: 10px 12px;
+  border: 1px solid rgba(255, 255, 255, 0.16);
+  border-radius: 8px;
+  background: rgba(10, 13, 15, 0.72);
+  color: #f4f7f9;
+  box-shadow: 0 8px 28px rgba(0, 0, 0, 0.26);
+  backdrop-filter: blur(8px);
+  pointer-events: none;
+}
+
+.camera-error-hud.has-error {
+  display: flex;
+  border-color: rgba(255, 91, 77, 0.72);
+  background: rgba(45, 14, 13, 0.86);
+}
+
+.camera-error-title {
+  margin-bottom: 3px;
+  font-size: 12px;
+  font-weight: 800;
+}
+
+.camera-error-message {
+  overflow: hidden;
+  color: rgba(244, 247, 249, 0.82);
+  font-size: 11px;
+  line-height: 1.35;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.range-hud {
+  position: absolute;
+  z-index: 4;
+  right: 0;
+  bottom: 0;
+  left: 0;
+  height: clamp(190px, 34%, 310px);
+  color: #f4f7f9;
+  pointer-events: none;
+}
+
+.range-hud-svg {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  overflow: visible;
+}
+
+.range-hud-fill {
+  fill: url(#rangeHudFill);
+}
+
+.range-hud-arc {
+  fill: none;
+  stroke: rgba(240, 246, 250, 0.82);
+  stroke-width: 2;
+  vector-effect: non-scaling-stroke;
+}
+
+.range-hud-arc-secondary {
+  stroke: rgba(77, 163, 255, 0.42);
+  stroke-width: 1;
+}
+
+.range-marker {
+  position: absolute;
+  display: grid;
+  justify-items: center;
+  min-width: 74px;
+  transform: translate(-50%, 50%);
+  text-align: center;
+  text-shadow: 0 2px 5px rgba(0, 0, 0, 0.95);
+}
+
+.range-label {
+  color: rgba(244, 247, 249, 0.77);
+  font-size: clamp(9px, 0.85vw, 12px);
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  white-space: nowrap;
+}
+
+.range-value {
+  min-height: 1.25em;
+  margin: 2px 0 8px;
+  color: #f8fbfd;
+  font-size: clamp(13px, 1.25vw, 20px);
+  line-height: 1;
+  white-space: nowrap;
+}
+
+.range-dot {
+  width: 13px;
+  height: 13px;
+  border: 2px solid currentColor;
+  border-radius: 50%;
+  background: rgba(14, 18, 20, 0.92);
+  box-shadow: 0 0 0 3px rgba(0, 0, 0, 0.25);
+}
+
+.range-marker.is-center .range-label,
+.range-marker.is-center .range-value {
+  color: #62b2ff;
+}
+
+.range-marker.is-center .range-dot {
+  width: 16px;
+  height: 16px;
+  box-shadow: 0 0 0 3px rgba(77, 163, 255, 0.2), 0 0 14px rgba(77, 163, 255, 0.72);
+}
+
+.range-marker.range-unknown { color: rgba(230, 236, 240, 0.68); }
+.range-marker.range-clear { color: #dfe9ef; }
+.range-marker.range-warning { color: var(--warning); }
+.range-marker.range-danger { color: var(--danger-hot); }
+
+.range-marker-far-left { left: 6.5%; bottom: 14%; }
+.range-marker-left { left: 20.5%; bottom: 31%; }
+.range-marker-half-left { left: 35%; bottom: 43%; }
+.range-marker-center { left: 50%; bottom: 47%; }
+.range-marker-half-right { left: 65%; bottom: 43%; }
+.range-marker-right { left: 79.5%; bottom: 31%; }
+.range-marker-far-right { left: 93.5%; bottom: 14%; }
+
+.range-hud.is-scanning .range-hud-arc {
+  animation: range-hud-pulse 0.9s ease-in-out infinite alternate;
+}
+
+.range-hud.is-scanning .range-dot {
+  animation: range-dot-pulse 0.9s ease-in-out infinite alternate;
+}
+
+@keyframes range-hud-pulse {
+  from { stroke-opacity: 0.42; }
+  to { stroke-opacity: 1; }
+}
+
+@keyframes range-dot-pulse {
+  from { transform: scale(0.82); opacity: 0.62; }
+  to { transform: scale(1.08); opacity: 1; }
+}
+
+@media (max-width: 820px) {
+  .camera-error-hud {
+    top: 9px;
+    left: 9px;
+    max-width: calc(100% - 18px);
+    padding: 8px 10px;
+  }
+
+  .range-hud {
+    height: clamp(150px, 38%, 230px);
+  }
+
+  .range-marker {
+    min-width: 52px;
+  }
+
+  .range-label {
+    font-size: 8px;
+  }
+
+  .range-value {
+    font-size: 12px;
+  }
+}
+
+
+/* Camera HUD thresholds restored without bringing back battery/heartbeat cards. */
+.distance-threshold-settings {
+  display: grid;
+  gap: 0.85rem;
+  margin-top: 1rem;
+  padding-top: 1rem;
+  border-top: 1px solid var(--line, rgba(255, 255, 255, 0.12));
+}
+
+.distance-threshold-settings .slider-label {
+  margin: 0;
+}

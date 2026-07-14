@@ -1,0 +1,98 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Marsy Map Viewer</title>
+  <link rel="stylesheet" href="/static/style.css" />
+  <link rel="stylesheet" href="/static/maps.css" />
+</head>
+<body class="maps-page">
+  <header class="topbar maps-topbar">
+    <div>
+      <div class="eyebrow">AstroSheep rover mapping</div>
+      <h1>Marsy Map Viewer</h1>
+    </div>
+    <div class="top-actions">
+      <span id="mapStatus" class="pill">loading maps</span>
+      <button id="refreshMapsBtn" class="mission-button">Refresh</button>
+      <button type="button" class="mission-button" onclick="window.location.href='/'">Dashboard</button>
+    </div>
+  </header>
+
+  <main class="maps-shell">
+    <aside class="panel maps-browser-panel">
+      <section class="panel-section maps-filter-section">
+        <div class="section-title">Current session map</div>
+        <div class="hint">The same JSON/SVG pair is updated after every exploration step and removed when the dashboard closes.</div>
+        <input id="mapSearch" type="hidden" value="" />
+        <input id="finalOnly" type="hidden" />
+        <input id="followLatest" type="hidden" checked />
+      </section>
+      <section class="map-list-section">
+        <div id="mapList" class="map-list" aria-live="polite"></div>
+      </section>
+    </aside>
+
+    <section class="main-view map-main-view">
+      <div class="view-header map-view-header">
+        <div>
+          <div id="mapTitle" class="section-title">No map selected</div>
+          <div id="mapSubtitle" class="hint">Run <code>explore_area</code> to create the live session map.</div>
+        </div>
+        <div class="map-view-actions">
+          <button id="fitMapBtn" class="mission-button">Fit</button>
+          <button id="zoomOutBtn" class="mission-button" aria-label="Zoom out">−</button>
+          <button id="zoomInBtn" class="mission-button" aria-label="Zoom in">+</button>
+        </div>
+      </div>
+
+      <div id="mapFrame" class="map-frame">
+        <canvas id="mapCanvas" aria-label="Marsy occupancy map"></canvas>
+        <div class="map-legend" aria-label="Map legend">
+          <span><i class="legend-free"></i>free</span>
+          <span><i class="legend-occupied"></i>occupied</span>
+          <span><i class="legend-path"></i>path</span>
+          <span><i class="legend-rover"></i>rover</span>
+        </div>
+        <div id="mapEmpty" class="map-empty">No map data</div>
+      </div>
+
+      <div class="map-help">Mouse wheel: zoom · drag: pan · double-click: fit map</div>
+    </section>
+
+    <aside class="panel map-details-panel">
+      <section class="panel-section">
+        <div class="section-title">Map summary</div>
+        <dl id="mapStats" class="telemetry-grid map-stats">
+          <div><dt>Map</dt><dd>—</dd></div>
+        </dl>
+      </section>
+
+      <section class="panel-section">
+        <div class="section-title">Layers</div>
+        <label class="check-label"><input id="showGrid" type="checkbox" checked /> Grid</label>
+        <label class="check-label"><input id="showFree" type="checkbox" checked /> Free cells</label>
+        <label class="check-label"><input id="showOccupied" type="checkbox" checked /> Occupied cells</label>
+        <label class="check-label"><input id="showVisits" type="checkbox" checked /> Visited cells</label>
+        <label class="check-label"><input id="showPath" type="checkbox" checked /> Rover path</label>
+      </section>
+
+      <section class="panel-section map-files-section">
+        <div class="section-title">Files</div>
+        <div class="button-grid one">
+          <a id="openJsonLink" class="map-file-link disabled" href="#" target="_blank" rel="noopener">Open JSON</a>
+          <a id="openSvgLink" class="map-file-link disabled" href="#" target="_blank" rel="noopener">Open SVG export</a>
+        </div>
+      </section>
+
+      <section class="panel-section map-note-section">
+        <div class="section-title">Mapping note</div>
+        <div id="mapNote" class="hint">Marsy SLAM-lite uses occupancy mapping and dead reckoning. It does not perform loop closure yet.</div>
+      </section>
+    </aside>
+  </main>
+
+  <script src="/static/maps.js"></script>
+</body>
+</html>
