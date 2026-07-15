@@ -31,6 +31,13 @@ def _env_float(name: str, default: float) -> float:
         return default
 
 
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(os.getenv(name, str(default)))
+    except ValueError:
+        return default
+
+
 @dataclass
 class SkillsConfig:
     full_speed_cm_s: float = _env_float("MARSY_FULL_SPEED_CM_S", 9.0)
@@ -48,6 +55,9 @@ class SkillsConfig:
     suspicious_jump_cm: float = _env_float("MARSY_SUSPICIOUS_JUMP_CM", 50.0)
     suspicious_ratio: float = _env_float("MARSY_SUSPICIOUS_RATIO", 1.5)
     recent_scan_max_age_s: float = _env_float("MARSY_RECENT_SCAN_MAX_AGE_S", 8.0)
+    front_unknown_limit: int = _env_int("MARSY_FRONT_UNKNOWN_LIMIT", 2)
+    uncertain_step_cm: float = _env_float("MARSY_UNCERTAIN_STEP_CM", 6.0)
+    uncertain_speed: int = _env_int("MARSY_UNCERTAIN_SPEED", 22)
     default_speed: int = 35
     default_turn_speed: int = 30
     default_steer_angle: int = 28
@@ -87,6 +97,7 @@ class MarsySkills:
         self.map.mark_pose(self.pose)
         self._last_scan_samples: list[RangeSample] = []
         self._last_scan_timestamp: float = 0.0
+        self._last_motion_uncertain_checks: int = 0
 
     # ------------------------------------------------------------------
     # Registry / generic dispatch
@@ -237,6 +248,7 @@ class MarsySkills:
                 "readings": raw_readings,
                 "valid_readings": [],
                 "spread_cm": None,
+                "minimum_valid_cm": None,
             }
         if len(valid_readings) < minimum_valid:
             return {
@@ -245,6 +257,7 @@ class MarsySkills:
                 "readings": raw_readings,
                 "valid_readings": valid_readings,
                 "spread_cm": None,
+                "minimum_valid_cm": round(min(valid_readings), 1),
             }
 
         distance = float(statistics.median(valid_readings))
@@ -257,6 +270,7 @@ class MarsySkills:
             "readings": raw_readings,
             "valid_readings": valid_readings,
             "spread_cm": round(spread, 1),
+            "minimum_valid_cm": round(min(valid_readings), 1),
         }
 
     def _run_for(self, duration_s: float, *, check_front: bool) -> tuple[float, Optional[float], str]:
@@ -265,6 +279,7 @@ class MarsySkills:
         started = time.time()
         blocked_distance: Optional[float] = None
         reason = "bounded" if requested_duration > self.config.max_motion_s else "completed"
+        uncertain_checks = 0
         try:
             while time.time() - started < duration:
                 if self._external_stop_requested():
@@ -275,15 +290,27 @@ class MarsySkills:
                 if check_front:
                     measurement = self._collect_distance_measurement(samples=3, sample_delay_s=0.01)
                     distance = measurement.get("distance_cm")
-                    if measurement.get("quality") != "measured":
-                        reason = "range_unknown"
+                    minimum_valid = measurement.get("minimum_valid_cm")
+
+                    # Unreliable/no-echo measurements are retained as uncertainty,
+                    # not converted into an obstacle. A real close echo still has
+                    # absolute priority and stops the rover immediately.
+                    if self._is_valid_distance(minimum_valid) and float(minimum_valid) < self.config.danger_distance_cm:
+                        blocked_distance = float(minimum_valid)
+                        reason = "blocked"
                         break
+
+                    if measurement.get("quality") != "measured":
+                        uncertain_checks += 1
+                        continue
+
                     if self._is_valid_distance(distance) and float(distance) < self.config.safe_distance_cm:
                         blocked_distance = float(distance)
                         reason = "blocked"
                         break
         finally:
             self.motion.stop()
+            self._last_motion_uncertain_checks = uncertain_checks
         return max(0.0, time.time() - started), blocked_distance, reason
 
     # ------------------------------------------------------------------
@@ -300,6 +327,9 @@ class MarsySkills:
         speed = clamp_speed(speed)
         if speed <= 0:
             return self._result(skill, False, "invalid_speed", "Forward speed must be above zero")
+
+        cautious = False
+        corridor: Optional[dict[str, Any]] = None
         if require_recent_scan:
             corridor = self.assess_forward_corridor()
             if not corridor["safe"]:
@@ -311,34 +341,90 @@ class MarsySkills:
                     corridor=corridor,
                     pose=self.pose,
                 )
+            cautious = corridor.get("status") == "uncertain_clear"
+
         requested = max(0.0, float(distance_cm))
         self.motion.mast_center()
         time.sleep(self.config.scan_settle_s)
         measurement = self._collect_distance_measurement(samples=3, sample_delay_s=0.02)
         current = measurement.get("distance_cm")
-        if measurement.get("quality") != "measured":
+        minimum_valid = measurement.get("minimum_valid_cm")
+
+        # Any real echo inside the danger zone is a hard stop, even if the
+        # overall series is unstable. Otherwise an unreliable series is allowed
+        # and simply switches the command to a short, slow cautious creep.
+        if self._is_valid_distance(minimum_valid) and float(minimum_valid) < self.config.danger_distance_cm:
             return self._result(
                 skill,
                 False,
-                "range_unknown",
-                "Front range is unreliable; refusing to move",
+                "blocked",
+                f"Possible close obstacle at {float(minimum_valid):.1f} cm",
+                distance_cm=minimum_valid,
                 measurement=measurement,
             )
-        if self._is_valid_distance(current) and float(current) < self.config.safe_distance_cm:
-            return self._result(skill, False, "blocked", f"Obstacle at {float(current):.1f} cm", distance_cm=current)
-        duration = requested / max(0.001, self._linear_speed_cm_s(speed))
-        self.motion.forward(speed, straighten=True)
+        if measurement.get("quality") == "measured":
+            if self._is_valid_distance(current) and float(current) < self.config.safe_distance_cm:
+                return self._result(
+                    skill,
+                    False,
+                    "blocked",
+                    f"Obstacle at {float(current):.1f} cm",
+                    distance_cm=current,
+                )
+        else:
+            cautious = True
+
+        commanded_distance = requested
+        commanded_speed = speed
+        if cautious:
+            commanded_distance = min(requested, max(1.0, float(self.config.uncertain_step_cm)))
+            commanded_speed = max(1, min(speed, clamp_speed(self.config.uncertain_speed)))
+
+        duration = commanded_distance / max(0.001, self._linear_speed_cm_s(commanded_speed))
+        self.motion.forward(commanded_speed, straighten=True)
         elapsed, blocked, reason = self._run_for(duration, check_front=True)
-        travelled = self._linear_speed_cm_s(speed) * elapsed
+        travelled = self._linear_speed_cm_s(commanded_speed) * elapsed
         self._integrate_linear(travelled)
+
+        common_data = {
+            "travelled_cm": travelled,
+            "requested_distance_cm": requested,
+            "commanded_distance_cm": commanded_distance,
+            "commanded_speed": commanded_speed,
+            "cautious": cautious,
+            "uncertain_checks": self._last_motion_uncertain_checks,
+            "pose": self.pose,
+        }
+        if corridor is not None:
+            common_data["corridor"] = corridor
+
         if reason == "blocked":
-            return self._result(skill, False, "blocked", f"Stopped for obstacle at {blocked:.1f} cm", travelled_cm=travelled, obstacle_cm=blocked, pose=self.pose)
-        if reason == "range_unknown":
-            return self._result(skill, False, "range_unknown", "Stopped because the front range became unreliable", travelled_cm=travelled, pose=self.pose)
+            return self._result(
+                skill,
+                False,
+                "blocked",
+                f"Stopped for obstacle at {blocked:.1f} cm",
+                obstacle_cm=blocked,
+                **common_data,
+            )
         if reason == "external_stop":
-            return self._result(skill, False, "stopped", "External stop requested", travelled_cm=travelled, pose=self.pose)
-        status = "completed" if duration <= self.config.max_motion_s else "bounded"
-        return self._result(skill, True, status, f"Moved forward about {travelled:.1f} cm", travelled_cm=travelled, pose=self.pose)
+            return self._result(
+                skill,
+                False,
+                "stopped",
+                "External stop requested",
+                **common_data,
+            )
+
+        status = "cautious" if cautious or self._last_motion_uncertain_checks else (
+            "completed" if duration <= self.config.max_motion_s else "bounded"
+        )
+        message = (
+            f"Cautious forward creep about {travelled:.1f} cm"
+            if status == "cautious"
+            else f"Moved forward about {travelled:.1f} cm"
+        )
+        return self._result(skill, True, status, message, **common_data)
 
     def move_backward(self, distance_cm: float = 8.0, speed: int = 25) -> SkillResult:
         skill = "move_backward"
@@ -486,6 +572,8 @@ class MarsySkills:
                 "message": "A fresh full scan is required before moving",
                 "unknown_angles": [-25.0, 0.0, 25.0],
                 "minimum_distance_cm": None,
+                "minimum_observed_cm": None,
+                "degraded": False,
             }
 
         front: list[RangeSample] = []
@@ -498,30 +586,83 @@ class MarsySkills:
             front.append(min(candidates, key=lambda item: abs(float(item.mast_angle_deg) - target)))
 
         unknown = [float(item.mast_angle_deg) for item in front if not item.trusted] + missing
-        reliable_distances = [float(item.distance_cm) for item in front if item.trusted and item.distance_cm is not None]
+        reliable_distances = [
+            float(item.distance_cm)
+            for item in front
+            if item.trusted and item.distance_cm is not None
+        ]
+        observed_distances: list[float] = []
+        for item in front:
+            for value in getattr(item, "readings", []) or []:
+                try:
+                    numeric = float(value)
+                except (TypeError, ValueError):
+                    continue
+                if self._is_valid_distance(numeric):
+                    observed_distances.append(numeric)
+            if item.distance_cm is not None and self._is_valid_distance(item.distance_cm):
+                observed_distances.append(float(item.distance_cm))
+
         minimum = min(reliable_distances) if reliable_distances else None
-        if unknown:
-            return {
-                "safe": False,
-                "status": "range_unknown",
-                "message": "Front corridor contains unreliable sonar sectors",
-                "unknown_angles": sorted(unknown),
-                "minimum_distance_cm": minimum,
-            }
-        if minimum is None or minimum < self.config.safe_distance_cm:
+        minimum_observed = min(observed_distances) if observed_distances else None
+
+        # A close real echo always blocks, regardless of the quality label.
+        if minimum_observed is not None and minimum_observed < self.config.danger_distance_cm:
             return {
                 "safe": False,
                 "status": "blocked",
-                "message": f"Front corridor is blocked at {minimum:.1f} cm" if minimum is not None else "Front corridor is blocked",
-                "unknown_angles": [],
+                "message": f"Front corridor has a close echo at {minimum_observed:.1f} cm",
+                "unknown_angles": sorted(unknown),
                 "minimum_distance_cm": minimum,
+                "minimum_observed_cm": minimum_observed,
+                "degraded": bool(unknown),
             }
+
+        # A trusted obstacle inside the normal safety distance also blocks.
+        if minimum is not None and minimum < self.config.safe_distance_cm:
+            return {
+                "safe": False,
+                "status": "blocked",
+                "message": f"Front corridor is blocked at {minimum:.1f} cm",
+                "unknown_angles": sorted(unknown),
+                "minimum_distance_cm": minimum,
+                "minimum_observed_cm": minimum_observed,
+                "degraded": bool(unknown),
+            }
+
+        # Unknown/no-echo/unstable sectors are no longer treated as obstacles.
+        # They permit only a short, slow creep; the motion loop still stops on
+        # any close echo that appears while the rover is moving.
+        if unknown:
+            return {
+                "safe": True,
+                "status": "uncertain_clear",
+                "message": "Front corridor is uncertain; cautious forward creep allowed",
+                "unknown_angles": sorted(unknown),
+                "minimum_distance_cm": minimum,
+                "minimum_observed_cm": minimum_observed,
+                "degraded": True,
+            }
+
+        if minimum is None:
+            return {
+                "safe": True,
+                "status": "uncertain_clear",
+                "message": "No reliable front echo; cautious forward creep allowed",
+                "unknown_angles": [-25.0, 0.0, 25.0],
+                "minimum_distance_cm": None,
+                "minimum_observed_cm": minimum_observed,
+                "degraded": True,
+            }
+
         return {
             "safe": True,
             "status": "clear",
             "message": f"Front corridor clear; minimum {minimum:.1f} cm",
             "unknown_angles": [],
             "minimum_distance_cm": minimum,
+            "minimum_observed_cm": minimum_observed,
+            "degraded": False,
         }
 
     def scan_arc(

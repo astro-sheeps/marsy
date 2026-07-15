@@ -6,7 +6,10 @@ This is not full SLAM yet. It combines:
 - time-based dead reckoning on the real rover;
 - mast ultrasonic scans;
 - a sparse occupancy grid;
-- a simple frontier-like direction score.
+- a forward-first local controller with committed obstacle turns.
+
+The occupancy map is currently observational: real-rover dead reckoning is not
+yet accurate enough for map-frontier scores to steer every motion safely.
 
 Simulator:
     python simulator/marsy_sim_ui.py
@@ -23,6 +26,11 @@ import argparse
 import time
 from pathlib import Path
 
+from behaviors.explore_navigation import (
+    ExploreMotionState,
+    choose_turn_direction,
+    movement_made_progress,
+)
 from marsy_backends.loader import load_rover
 from marsy_core.motion import MarsyMotion
 from marsy_core.sensors import MarsySensors
@@ -39,6 +47,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--step-distance", type=float, default=12.0, help="Forward distance per exploration step, cm")
     parser.add_argument("--speed", type=int, default=30, help="Forward speed 0-100")
     parser.add_argument("--rotate-speed", type=int, default=25, help="In-place rotation speed 0-100")
+    parser.add_argument("--turn-step", type=float, default=30.0, help="Committed recovery turn increment, degrees")
+    parser.add_argument(
+        "--max-turns-without-progress",
+        type=int,
+        default=4,
+        help="Stop instead of spinning forever after this many committed turns",
+    )
     parser.add_argument("--safe-distance", type=float, default=40.0, help="Minimum clear distance for forward motion, cm")
     parser.add_argument("--danger-distance", type=float, default=24.0, help="Distance considered dangerously close, cm")
     parser.add_argument("--max-range", type=float, default=200.0, help="Maximum mapped sonar range, cm")
@@ -89,42 +104,14 @@ def save_map(skills: MarsySkills, map_dir: Path, step: int, final: bool = False)
     return json_path, svg_path
 
 
-def _sample_quality(sample: object) -> str:
-    if isinstance(sample, dict):
-        return str(sample.get("quality", "measured" if sample.get("valid_hit") else "unknown"))
-    return str(getattr(sample, "quality", "measured" if getattr(sample, "valid_hit", False) else "unknown"))
-
-
-def _sample_value(sample: object, name: str):
-    return sample.get(name) if isinstance(sample, dict) else getattr(sample, name)
-
-
-def choose_direction(skills: MarsySkills, samples: list[object], safe_distance_cm: float) -> tuple[float, float, float] | None:
-    candidates: list[tuple[float, float, float]] = []
-    for sample in samples:
-        if _sample_quality(sample) != "measured":
-            continue
-        angle = float(_sample_value(sample, "mast_angle_deg"))
-        distance = _sample_value(sample, "distance_cm")
-        if distance is None:
-            continue
-        clearance = float(distance)
-        if clearance < safe_distance_cm:
-            continue
-        score = skills.map.direction_score(skills.pose, angle, clearance)
-        candidates.append((score, angle, clearance))
-    if not candidates:
-        return None
-    return max(candidates, key=lambda item: item[0])
-
-
 def scan_with_retry(
     skills: MarsySkills,
     scan_angles: list[float],
     *,
-    retries: int = 1,
+    retries: int = 2,
     offset_deg: float = 4.0,
 ) -> tuple[list[object], dict]:
+    """Collect a full scan, retrying uncertain sectors without moving the rover."""
     result = skills.scan_arc(angles=scan_angles, samples=3)
     samples = list(result.data.get("samples", []))
     corridor = skills.assess_forward_corridor(samples)
@@ -145,45 +132,13 @@ def scan_with_retry(
     return samples, corridor
 
 
-def recovery_turn_angle(samples: list[object], step: int) -> float:
-    trusted: list[tuple[float, float]] = []
-    for sample in samples:
-        if _sample_quality(sample) != "measured":
-            continue
-        angle = float(_sample_value(sample, "mast_angle_deg"))
-        distance = _sample_value(sample, "distance_cm")
-        if distance is None or abs(angle) < 8.0:
-            continue
-        trusted.append((float(distance), angle))
-    if trusted:
-        _, best_angle = max(trusted, key=lambda item: item[0])
-        return max(-55.0, min(55.0, best_angle))
-    return 35.0 if step % 2 == 0 else -35.0
-
-
-def recover_without_forward_motion(
-    skills: MarsySkills,
-    samples: list[object],
-    corridor: dict,
-    *,
-    step: int,
-    rotate_speed: int,
-) -> bool:
-    skills.stop(brake=True, reset_pose=False)
-    minimum = corridor.get("minimum_distance_cm")
-    if minimum is not None and float(minimum) < skills.config.danger_distance_cm:
-        skills.move_backward(distance_cm=5.0, speed=20)
-    angle = recovery_turn_angle(samples, step)
-    log(
-        f"Unsafe or unknown corridor; rotate {angle:+.0f}° without moving forward",
-        source=SOURCE,
-        level="warning",
-        event="safe_recovery",
-        corridor_status=corridor.get("status"),
-        unknown_angles=corridor.get("unknown_angles", []),
-    )
-    result = skills.rotate(angle, speed=rotate_speed)
-    return result.ok
+def _side_summary(evidence: object) -> dict:
+    return {
+        "trusted": getattr(evidence, "trusted_count", 0),
+        "clear": getattr(evidence, "clear_count", 0),
+        "median_cm": getattr(evidence, "median_clearance_cm", None),
+        "minimum_cm": getattr(evidence, "minimum_clearance_cm", None),
+    }
 
 
 def main() -> None:
@@ -229,7 +184,56 @@ def main() -> None:
             mapping_mode="slam_lite_no_loop_closure",
         )
 
-        for step in range(max(0, args.steps)):
+        navigation = ExploreMotionState()
+        max_actions = max(max(0, args.steps) * 6, max(0, args.steps) + 8)
+        turn_step = max(15.0, min(45.0, abs(float(args.turn_step))))
+        max_turns = max(2, int(args.max_turns_without_progress))
+
+        def perform_committed_turn(samples: list[object], corridor: dict) -> bool:
+            minimum = corridor.get("minimum_distance_cm")
+            if (
+                minimum is not None
+                and float(minimum) < skills.config.danger_distance_cm
+                and not navigation.reversed_for_current_obstacle
+            ):
+                reverse = skills.move_backward(distance_cm=5.0, speed=20)
+                if reverse.ok:
+                    navigation.note_reverse()
+
+            sign, left, right, reason = choose_turn_direction(
+                samples,
+                safe_distance_cm=args.safe_distance,
+                committed_sign=navigation.committed_turn_sign,
+                default_sign=1,
+            )
+            committed = navigation.commit_turn(sign)
+            angle = committed * turn_step
+            log(
+                f"Front unavailable ({corridor.get('status')}): committed turn {angle:+.0f}°",
+                source=SOURCE,
+                level="warning",
+                event="committed_turn",
+                decision_reason=reason,
+                left=_side_summary(left),
+                right=_side_summary(right),
+                turns_without_progress=navigation.turns_without_progress,
+            )
+            rotation = skills.rotate(angle, speed=args.rotate_speed)
+            if not rotation.ok:
+                return False
+            navigation.note_turn()
+            if navigation.turns_without_progress >= max_turns:
+                log(
+                    "No forward progress after the committed turn limit; stopping instead of oscillating",
+                    source=SOURCE,
+                    level="warning",
+                    event="turn_limit",
+                    turns_without_progress=navigation.turns_without_progress,
+                )
+                return False
+            return True
+
+        while navigation.completed_moves < max(0, args.steps) and navigation.actions < max_actions:
             if simulator_stop_requested():
                 log("Mission stopped from simulator UI", source=SOURCE, level="warning", event="ui_stop")
                 break
@@ -238,63 +242,72 @@ def main() -> None:
                 break
 
             samples, corridor = scan_with_retry(skills, scan_angles)
-            choice = choose_direction(skills, samples, args.safe_distance)
 
-            if choice is None:
-                skills.set_led_status("obstacle")
-                if not recover_without_forward_motion(
-                    skills, samples, corridor, step=step, rotate_speed=args.rotate_speed
-                ):
-                    break
-                skills.set_led_status("exploring")
-            else:
-                score, angle, clearance = choice
-                log(
-                    f"Step {step}: choose {angle:+.0f}°; clearance={clearance:.1f} cm; score={score:.1f}",
-                    source=SOURCE,
-                    event="direction_selected",
-                    step=step,
-                    angle_deg=angle,
-                    clearance_cm=clearance,
-                    score=score,
+            if corridor.get("safe"):
+                movement = skills.move_forward(
+                    distance_cm=args.step_distance,
+                    speed=args.speed,
+                    require_recent_scan=True,
                 )
-                if abs(angle) >= 8.0:
-                    rotation = skills.rotate(angle, speed=args.rotate_speed)
-                    if not rotation.ok:
-                        break
-                    # A scan made before rotation is no longer aligned with the
-                    # rover. Always scan again before any forward movement.
-                    samples, corridor = scan_with_retry(skills, scan_angles)
-
-                if not corridor.get("safe"):
-                    skills.set_led_status("obstacle")
-                    if not recover_without_forward_motion(
-                        skills, samples, corridor, step=step, rotate_speed=args.rotate_speed
-                    ):
-                        break
-                    skills.set_led_status("exploring")
-                else:
-                    movement = skills.move_forward(
-                        distance_cm=args.step_distance,
-                        speed=args.speed,
-                        require_recent_scan=True,
+                if movement_made_progress(movement, args.step_distance):
+                    navigation.note_progress()
+                    completed_steps = navigation.completed_moves
+                    log(
+                        f"Forward progress {completed_steps}/{args.steps}",
+                        source=SOURCE,
+                        event="forward_progress",
+                        completed_moves=completed_steps,
+                        travelled_cm=movement.data.get("travelled_cm"),
                     )
-                    if not movement.ok:
-                        skills.set_led_status("obstacle")
-                        fallback_corridor = skills.assess_forward_corridor()
-                        if not recover_without_forward_motion(
-                            skills, samples, fallback_corridor, step=step, rotate_speed=args.rotate_speed
-                        ):
+                else:
+                    navigation.note_failed_forward_action()
+                    if movement.status == "range_unknown" and navigation.may_retry_same_heading(limit=1):
+                        log(
+                            "Forward range became uncertain; rescan the same heading before turning",
+                            source=SOURCE,
+                            level="warning",
+                            event="same_heading_retry",
+                            travelled_cm=movement.data.get("travelled_cm"),
+                        )
+                    else:
+                        log(
+                            f"Forward movement did not make enough progress ({movement.status}); "
+                            "turn in the committed recovery direction",
+                            source=SOURCE,
+                            level="warning",
+                            event="forward_progress_failed",
+                            travelled_cm=movement.data.get("travelled_cm"),
+                        )
+                        failed_corridor = {
+                            "safe": False,
+                            "status": movement.status,
+                            "minimum_distance_cm": movement.data.get("obstacle_cm")
+                            or movement.data.get("distance_cm"),
+                        }
+                        if not perform_committed_turn(samples, failed_corridor):
                             break
-                        skills.set_led_status("exploring")
+            else:
+                if corridor.get("status") == "range_unknown" and navigation.may_retry_same_heading(limit=1):
+                    log(
+                        "Front corridor is uncertain; hold heading and rescan once before turning",
+                        source=SOURCE,
+                        level="warning",
+                        event="same_heading_retry",
+                        unknown_angles=corridor.get("unknown_angles", []),
+                    )
+                else:
+                    if not perform_committed_turn(samples, corridor):
+                        break
 
-            completed_steps = step + 1
+
+            completed_steps = navigation.completed_moves
             json_path, svg_path = save_map(skills, map_dir, completed_steps)
             log(
                 f"Map saved: {json_path} and {svg_path}",
                 source=SOURCE,
                 event="map_saved",
                 step=completed_steps,
+                actions=navigation.actions,
                 json_path=str(json_path),
                 svg_path=str(svg_path),
             )
