@@ -188,9 +188,11 @@ function updateState(data) {
 
   if (data.lidar_scan) applyLidarScan(data.lidar_scan);
   // The continuously polled front measurement belongs to the centre marker.
-  const exploreRunning = Boolean(data.mission?.running && data.mission?.name === 'explore_area');
+  const missionOwnsRangeHud = Boolean(
+    data.mission?.running && ['explore_area', 'agent_mission'].includes(data.mission?.name),
+  );
   const frontDistance = numericDistance(data.distance_cm);
-  if (!exploreRunning && frontDistance !== null && frontDistance > 0 && frontDistance <= 400) {
+  if (!missionOwnsRangeHud && frontDistance !== null && frontDistance > 0 && frontDistance <= 400) {
     setRangeValue('center', frontDistance, 'measured');
     renderRangeHud();
   }

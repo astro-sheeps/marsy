@@ -57,6 +57,12 @@ NO_ECHO_MEANS_CLEAR = os.getenv("MARSY_WEB_NO_ECHO_BLOCKS", "0").strip().lower()
 FORWARD_COMMANDS = {"forward", "forward_left", "forward_right"}
 STEERING_COMMANDS = {"steer_left", "steer_right"}
 MOVING_COMMANDS = FORWARD_COMMANDS | {"reverse", "reverse_left", "reverse_right", "spin_left", "spin_right"}
+AGENT_DEFAULT_GOAL = os.getenv(
+    "MARSY_AGENT_DEFAULT_GOAL",
+    "Look around, choose the clearest direction, make three cautious steps, "
+    "explore for 30 seconds, and stop. If the path is blocked, try another direction.",
+)
+AGENT_DEFAULT_MODEL = os.getenv("MARSY_LLM_MODEL", "openai/gpt-oss-20b")
 
 MISSION_CATALOG: list[dict[str, Any]] = [
     {
@@ -85,6 +91,34 @@ MISSION_CATALOG: list[dict[str, Any]] = [
             {"name": "danger_distance", "label": "Danger distance, cm", "type": "number", "min": 10, "max": 90, "step": 1, "default": 28},
             {"name": "resolution", "label": "Map cell, cm", "type": "number", "min": 2, "max": 20, "step": 1, "default": 5},
             {"name": "return_home", "label": "Return home after exploration", "type": "checkbox", "default": False},
+        ],
+    },
+    {
+        "id": "agent_mission",
+        "name": "AI Agent",
+        "description": "Ask Groq to build a validated skill plan, execute it safely, and replan once if needed.",
+        "map_enabled": True,
+        "parameters": [
+            {
+                "name": "goal",
+                "label": "Mission goal",
+                "type": "textarea",
+                "rows": 6,
+                "wide": True,
+                "default": AGENT_DEFAULT_GOAL,
+            },
+            {
+                "name": "model",
+                "label": "Groq model",
+                "type": "select",
+                "default": AGENT_DEFAULT_MODEL,
+                "options": [
+                    {"value": "openai/gpt-oss-20b", "label": "GPT-OSS 20B — fast"},
+                    {"value": "openai/gpt-oss-120b", "label": "GPT-OSS 120B — stronger"},
+                ],
+            },
+            {"name": "max_replans", "label": "Maximum replans", "type": "number", "min": 0, "max": 2, "step": 1, "default": 1},
+            {"name": "refresh_plan", "label": "Generate a fresh plan", "type": "checkbox", "default": False},
         ],
     },
 ]
@@ -954,6 +988,8 @@ class RoverController:
             return self._start_avoid_obstacle(payload)
         if mission == "explore_area":
             return self._start_explore_area(payload)
+        if mission == "agent_mission":
+            return self._start_agent_mission(payload)
         with self._lock:
             self.state.last_error = f"mission is not dashboard-compatible: {mission}"
         return self.snapshot_state()
@@ -1205,7 +1241,6 @@ class RoverController:
                     )
                     skills.sync_pose()
                     skills.home_pose = skills.pose.normalized()
-                    skills.set_led_status("exploring")
 
                 self.log(
                     "Dashboard explore area started: "
@@ -1338,9 +1373,6 @@ class RoverController:
                     with self._hardware_lock:
                         result = skills.return_home()
                     self.log(f"Return home: {result.message}")
-                if skills is not None and not self._mission_stop_event.is_set():
-                    with self._hardware_lock:
-                        skills.set_led_status("success")
             except Exception as exc:
                 returncode = 1
                 self.log(f"Dashboard explore area failed: {type(exc).__name__}: {exc}")
@@ -1367,6 +1399,280 @@ class RoverController:
                 self.log(f"Dashboard explore area finished with code {returncode}")
 
         thread = threading.Thread(target=_run, name="marsy-explore-area", daemon=True)
+        self._mission_thread = thread
+        thread.start()
+        return self.snapshot_state()
+
+
+    def _start_agent_mission(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """Run the Groq agent in the dashboard process using shared rover I/O."""
+        goal = str(payload.get("goal") or AGENT_DEFAULT_GOAL).strip()
+        if not goal:
+            with self._lock:
+                self.state.last_error = "agent mission goal is empty"
+            return self.snapshot_state()
+        goal = goal[:1200]
+        model = str(payload.get("model") or AGENT_DEFAULT_MODEL).strip()[:120]
+        max_replans = _clamp_int(payload.get("max_replans", 1), 0, 2, 1)
+        refresh_plan = bool(payload.get("refresh_plan", False))
+        safe_distance = _clamp_float(payload.get("safe_distance", 40.0), 20.0, 120.0, 40.0)
+        danger_distance = _clamp_float(payload.get("danger_distance", 24.0), 10.0, safe_distance, 24.0)
+        max_range = _clamp_float(payload.get("max_range", 200.0), 50.0, 400.0, 200.0)
+
+        if not self._begin_mission("agent_mission", safe_distance, danger_distance):
+            return self.snapshot_state()
+
+        def _set_progress(update: Dict[str, Any]) -> None:
+            with self._lock:
+                progress = dict(self.state.mission.progress)
+                progress.update(update)
+                progress.setdefault("goal", goal)
+                progress.setdefault("model", model)
+                self.state.mission.progress = progress
+            phase = update.get("phase")
+            if phase == "step_started":
+                self.log(
+                    f"Agent step {update.get('step')}/{update.get('total_steps')}: "
+                    f"{update.get('skill')}"
+                )
+            elif phase == "replanning":
+                self.log(f"Agent replanning after {update.get('failed_step')}")
+
+        agent_scan_sequence = [0]
+
+        def _next_agent_scan_id() -> str:
+            agent_scan_sequence[0] += 1
+            return f"agent-{int(time.time() * 1000)}-{agent_scan_sequence[0]}"
+
+        def _publish_agent_sweep(
+            samples: list[Any],
+            *,
+            scanning: bool,
+            scan_id: str,
+        ) -> None:
+            """Publish agent sonar samples to the camera range HUD in real time."""
+            serialised: list[Dict[str, Any]] = []
+            center_distance: Optional[float] = None
+            for sample in samples:
+                try:
+                    angle = float(sample.mast_angle_deg)
+                    raw_distance = sample.distance_cm
+                    distance = None if raw_distance is None else round(float(raw_distance), 1)
+                    no_echo = bool(getattr(sample, "no_echo", raw_distance is None))
+                    quality = str(
+                        getattr(
+                            sample,
+                            "quality",
+                            "measured" if distance is not None else "unknown",
+                        )
+                    )
+                    spread_cm = getattr(sample, "spread_cm", None)
+                except (AttributeError, TypeError, ValueError):
+                    continue
+                serialised.append(
+                    {
+                        "angle_deg": angle,
+                        "distance_cm": distance,
+                        "measured": True,
+                        "no_echo": no_echo,
+                        "quality": quality,
+                        "spread_cm": spread_cm,
+                    }
+                )
+                if abs(angle) < 0.5 and distance is not None:
+                    center_distance = distance
+
+            with self._lock:
+                self.state.lidar_scan = {
+                    "kind": "sweep",
+                    "source": "agent_mission",
+                    "scan_id": scan_id,
+                    "scanning": scanning,
+                    "max_range_cm": max_range,
+                    "samples": serialised,
+                    "updated_at": time.time(),
+                }
+                if center_distance is not None:
+                    self.state.distance_cm = center_distance
+
+        class _HardwareLockedSkills:
+            def __init__(self, wrapped: Any) -> None:
+                self._wrapped = wrapped
+
+            def _external_stop_requested(self) -> bool:
+                return self_outer._mission_stop_event.is_set() or self_outer._stop_threads.is_set()
+
+            def scan_arc(self, *args: Any, **kwargs: Any) -> Any:
+                scan_id = _next_agent_scan_id()
+                original_callback = kwargs.pop("on_sample", None)
+                latest_samples: list[Any] = []
+
+                def _on_sample(sample: Any, collected: list[Any]) -> None:
+                    latest_samples[:] = collected
+                    _publish_agent_sweep(collected, scanning=True, scan_id=scan_id)
+                    if original_callback is not None:
+                        original_callback(sample, collected)
+
+                kwargs["on_sample"] = _on_sample
+                try:
+                    with self_outer._hardware_lock:
+                        result = self._wrapped.scan_arc(*args, **kwargs)
+                    data = getattr(result, "data", {})
+                    final_samples = data.get("samples", []) if isinstance(data, dict) else []
+                    latest_samples[:] = list(final_samples or latest_samples)
+                    return result
+                finally:
+                    _publish_agent_sweep(latest_samples, scanning=False, scan_id=scan_id)
+
+            def call(self, skill: str, **arguments: Any) -> Any:
+                if str(skill) == "scan_arc":
+                    return self.scan_arc(**arguments)
+                with self_outer._hardware_lock:
+                    return self._wrapped.call(skill, **arguments)
+
+            def __getattr__(self, name: str) -> Any:
+                value = getattr(self._wrapped, name)
+                if not callable(value):
+                    return value
+
+                def _locked_call(*args: Any, **kwargs: Any) -> Any:
+                    with self_outer._hardware_lock:
+                        return value(*args, **kwargs)
+
+                return _locked_call
+
+        self_outer = self
+
+        def _run() -> None:
+            returncode = 0
+            journal = None
+            try:
+                from marsy_agent import AgentExecutor, GroqPlanner, PlanValidator
+                from marsy_agent.cache import PlanCache
+                from marsy_agent.journal import AgentJournal
+                from skills import MarsySkills, SkillsConfig, SparseOccupancyGrid
+
+                planner = GroqPlanner(model=model)
+                validator = PlanValidator()
+                journal = AgentJournal(
+                    goal=goal,
+                    planner="groq",
+                    model=planner.model,
+                    directory=PROJECT_ROOT / "artifacts" / "agent_runs",
+                )
+                _set_progress({"phase": "planning", "step": 0, "total_steps": 0})
+
+                cache = PlanCache(directory=PROJECT_ROOT / "artifacts" / "agent_cache")
+                plan = None
+                plan_source = "groq"
+                if not refresh_plan:
+                    cached = cache.load(goal=goal, planner="groq", model=planner.model)
+                    if cached is not None:
+                        try:
+                            plan = validator.validate(cached)
+                            plan_source = "cache"
+                            self.log(f"Agent plan cache hit: {cache.path.name}")
+                        except Exception:
+                            cache.clear()
+                            self.log("Agent cached plan was invalid and was removed")
+
+                if plan is None:
+                    self.log(f"Requesting agent plan from Groq: {planner.model}")
+                    plan = validator.validate(planner.create_plan(goal))
+                    cache.save(goal=goal, planner="groq", model=planner.model, plan=plan)
+                    self.log(f"Agent plan cached: {cache.path.name}")
+
+                journal.set_plan_source(plan_source)
+                journal.set_initial_plan(plan)
+                _set_progress(
+                    {
+                        "phase": "initializing",
+                        "plan_source": plan_source,
+                        "plan_revision": 0,
+                        "plan": plan.to_dict(),
+                        "step": 0,
+                        "total_steps": len(plan.steps),
+                    }
+                )
+
+                with self._hardware_lock:
+                    self._ensure_initialized()
+                    assert self._rover is not None
+                    assert self._motion is not None
+                    assert self._sensors is not None
+                    config = SkillsConfig(
+                        safe_distance_cm=safe_distance,
+                        danger_distance_cm=danger_distance,
+                        max_range_cm=max_range,
+                        default_speed=22,
+                        default_turn_speed=22,
+                    )
+                    occupancy_map = SparseOccupancyGrid(
+                        resolution_cm=5.0,
+                        max_range_cm=max_range,
+                    )
+                    raw_skills = MarsySkills(
+                        self._rover,
+                        motion=self._motion,
+                        sensors=self._sensors,
+                        occupancy_map=occupancy_map,
+                        config=config,
+                    )
+                    self._motion.stop_and_reset()
+                    raw_skills.sync_pose()
+                    raw_skills.home_pose = raw_skills.pose.normalized()
+
+                locked_skills = _HardwareLockedSkills(raw_skills)
+                executor = AgentExecutor(
+                    skills=locked_skills,
+                    planner=planner,
+                    validator=validator,
+                    max_replans=max_replans,
+                    progress_callback=_set_progress,
+                )
+                report = executor.execute(goal=goal, plan=plan)
+                journal.set_report(report)
+                returncode = 0 if report.ok else (130 if report.status == "stopped" else 2)
+                _set_progress(
+                    {
+                        "phase": "finished",
+                        "status": report.status,
+                        "message": report.message,
+                        "journal": str(journal.path.relative_to(PROJECT_ROOT)),
+                    }
+                )
+                if report.ok:
+                    self.log("Dashboard agent mission completed")
+                elif report.status == "stopped":
+                    self.log("Dashboard agent mission stopped")
+                else:
+                    self.log(f"Dashboard agent mission failed: {report.message}")
+                    with self._lock:
+                        self.state.last_error = f"agent mission: {report.message}"
+            except Exception as exc:
+                returncode = 1
+                if journal is not None:
+                    try:
+                        journal.set_error(exc)
+                    except Exception:
+                        pass
+                self.log(f"Dashboard agent mission failed: {type(exc).__name__}: {exc}")
+                with self._lock:
+                    self.state.last_error = f"agent mission failed: {type(exc).__name__}: {exc}"
+                    self.state.mission.progress.update(
+                        {"phase": "error", "status": "error", "message": str(exc)}
+                    )
+            finally:
+                try:
+                    with self._hardware_lock:
+                        if self._motion is not None:
+                            self._motion.brake_and_reset()
+                except Exception as exc:
+                    self.log(f"agent shutdown brake warning: {exc}")
+                self._finish_mission("agent_mission", returncode)
+                self.log(f"Dashboard agent mission finished with code {returncode}")
+
+        thread = threading.Thread(target=_run, name="marsy-agent-mission", daemon=True)
         self._mission_thread = thread
         thread.start()
         return self.snapshot_state()
